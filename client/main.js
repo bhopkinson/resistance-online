@@ -17,7 +17,8 @@ var cardNames = {
 
 var g;
 var resetGlobals = function() {
-     g = {
+    var lobbyPlayers = (g && g.lobbyPlayers) ? g.lobbyPlayers : {};
+    g = {
         lobbyPlayers: {},
         status: '',
         msgs: [],
@@ -29,12 +30,18 @@ var resetGlobals = function() {
         gamelogs: [],
         gamelogIdx: 0,
         highlights: {},
+        highlights2: {},
+        highlights3: {},
+        textHighlights: {},
         guns: [],
         investigator: null,
+        excalibur: null,
         games: [],
-        votelog: { rounds:[0,0,0,0,0], approve:[], reject:[], onteam:[], leader:[], investigator:[]},
-        scoreboard: {}
+        votelog: { rounds:[0,0,0,0,0], approve:[], reject:[], onteam:[], leader:[], investigator:[], excalibur:[], excalibured:[]},
+        scoreboard: {},
+        settings: { anonMode: false, anonCategory: 'color' }
     };
+    g.lobbyPlayers = lobbyPlayers;
 }
 resetGlobals();
 
@@ -43,27 +50,41 @@ var leaderOffsetY = 60;
 var gunsOffsetX = 5;
 var gunsOffsetY = 40;
 var investigatorOffsetX = 7;
+var excaliburOffsetX = 5;
+var excaliburOffsetY = 10;
+
+var myId = null;
+var audioLoaded = false;
+var canBuzz = true;
+var pollNum = 0;
+var mutedPlayers = [];
+
+var socket;
 
 // User input handlers
 var onJoinGame = function(id) {
-    sendAjax({ cmd:'join', id:id });
+    // load audio to fix iOS needing a click to play audio
+    if (!audioLoaded) { $('#audio')[0].load(); audioLoaded = true; }
+    sendData({ cmd:'join', id:id });
 }
 
-var onCreateGame = function(type) {
+var onCreateGame = function(type, isRanked, special) {
     return function() {
-        sendAjax({ cmd:'join', gameType:type });
+        // load audio to fix iOS needing a click to play audio
+        if (!audioLoaded) { $('#audio')[0].load(); audioLoaded = true; }
+        sendData({ cmd:'join', gameType:type, isRanked:isRanked, special:special });
     }
 }
 
 var onLeaveGame = function() {
-    sendAjax({ cmd:'leave' });
+    sendData({ cmd:'leave' });
 }
 
 var onEnter = function(cmd) {
     return function(event) {
         if (event.keyCode === 13) {
             if (event.target.value != '') {
-                sendAjax({ cmd:cmd, msg:event.target.value });
+                sendData({ cmd:cmd, msg:event.target.value });
                 event.target.value = '';
             }
             event.preventDefault();
@@ -88,7 +109,7 @@ var onDismissChoose = function(response) {
         response.length !== question.n) {
         return;
     }
-    sendAjax({ cmd:question.cmd, choiceId:question.choiceId, choice:response });
+    sendData({ cmd:question.cmd, choiceId:question.choiceId, choice:response });
     g.choices.splice(g.choiceIdx, 1);
     g.choiceIdx = g.choiceIdx % g.choices.length;
     if (g.choices.length === 0) {
@@ -118,6 +139,27 @@ var onClickUserTile = function(id) {
                 drawMsgArea();
             }
         }
+        else {
+            if (localStorage.highlight && JSON.parse(localStorage.highlight)) {
+                g.highlights2[id] = !g.highlights2[id];
+                drawPlayers();
+                drawMsgArea();
+            }
+        }
+    }
+}
+
+var onClickUserName = function(id) {
+    return function(event) {
+        if (localStorage.highlightText && JSON.parse(localStorage.highlightText)) {
+            g.textHighlights[id] = !g.textHighlights[id];
+            if (g.textHighlights[id]) {
+                $('.'+id+'-chat').addClass('chat-highlight');
+            }
+            else {
+                $('.'+id+'-chat').removeClass('chat-highlight');
+            }
+        }
     }
 }
 
@@ -131,6 +173,47 @@ var onPrevGameLog = function() {
     drawGameLog();
 }
 
+var onClickClaim = function(isClaim) {
+    return function() {
+        sendData({ cmd:'claim', isClaim:isClaim });
+    }
+}
+
+var onClickPoll = function() {
+    return function() {
+        pollNum++;
+        pollLoop();
+    }
+}
+
+var onClickRoleChoice = function(cancel) {
+    return function(e) {
+        e.preventDefault();
+        var role = $(this).html();
+        sendData({ cmd: 'chooseRole', role: role, cancel: cancel });
+    }
+}
+
+var onClickSettings = function() {
+    $("#settings-dialog").dialog("open");
+}
+
+var onClickSetting = function() {
+    return function() {
+        sendData({ cmd: 'setting', setting: { name:$(this).attr('data-name'), value: $(this).prop( "checked" ) } });
+    }
+}
+
+var onChangeSetting = function() {
+    return function() {
+        var name = $(this).attr('data-name');
+        var value = $(this).val();
+        if (g.settings[name] !== value) {
+            sendData({ cmd: 'setting', setting: { name: $(this).attr('data-name'), value: $(this).val() } });
+        }
+    }
+}
+
 // Server message handlers
 var onJoin = function() {
     $("#game-container").removeClass("hidden");
@@ -142,13 +225,25 @@ var onJoin = function() {
     drawGameLog();
     drawGuns();
     drawInvestigator();
+    drawExcalibur();
+    drawSettings();
     $('#scoreboard').html('');
-    $('#chat-text').html('<div class=current></div>');
+    $('.chat-text').html('<div class=current></div>');
+
+    $(".choose-role").removeClass("hidden");
+    $(".choose-role-desc").addClass("hidden");
+    $(".cancel-choose-role").addClass("hidden");
 }
 
 var onLeave = function() {
-    $("#game-container").addClass('hidden');
-    $("#lobby-container").removeClass('hidden');
+    var isDiscussionContainer = $('.content-container').not('.hidden').first().attr('id') === 'discussion-container';
+    if (isDiscussionContainer) {
+        previousActiveContainer = $('#lobby-container');
+    }
+    else {
+        $("#game-container").addClass('hidden');
+        $("#lobby-container").removeClass('hidden');
+    }
     drawGames();
 }
 
@@ -156,13 +251,19 @@ var onChat = function(data) {
     if (data.isSpectator && $('#mute-spectators').prop('checked')) {
         return;
     }
-    updateChat($('#chat-text'), data);
+    if (isMuted(data.player) && !(inGame(getId(data.player)) && inGame(myId))) {
+        return;
+    }
+    updateChat($('.chat-text'), data);
     highlightTab('#chat-nav-tab');
 }
 
 var onAllChat = function(data) {
+    if ( isMuted(data.player) && !(inGame(getId(data.player)) && inGame(myId)) ) {
+        return;
+    }
     updateChat($('#lobby-chat-text'), data);
-    updateChat($('#all-chat-text'), data);
+    updateChat($('.all-chat-text'), data);
     if (!$('#game-container').hasClass('hidden')) {
         highlightTab('#all-chat-nav-tab');
     }
@@ -231,6 +332,17 @@ var onLeader = function(data) {
 }
 
 var onPlayers = function(data) {
+    // Notifications
+    if (g.players && data.players.length > g.players.length && g.players.length != 0) {
+        if (localStorage.beep && JSON.parse(localStorage.beep)) {
+            $('#audio')[0].play();
+        }
+        if (localStorage.titleNotification && JSON.parse(localStorage.titleNotification) && !windowFocus) {
+            pageTitleNotification.off();
+            pageTitleNotification.on("("+data.players.length+") players", 1000);
+        }
+    }
+
     g.players = data.players;
     for (var i = 0; i < g.players.length; ++i) {
         g.players[i].name = xmlEscape(g.players[i].name);
@@ -246,6 +358,8 @@ var onPlayers = function(data) {
         
     drawPlayers();
     drawVoteLog();
+    drawSettings();
+
 }
 
 var onScoreboard = function(data) {
@@ -272,6 +386,8 @@ var onScoreboard = function(data) {
         g.votelog.reject.push([]);
         g.votelog.onteam.push([]);
         g.votelog.investigator.push(null);
+        g.votelog.excalibur.push(null);
+        g.votelog.excalibured.push(null);
         drawVoteLog();
     }
 }
@@ -316,6 +432,7 @@ var onGameLog = function(data) {
     }
     g.gamelogs[g.gamelogs.length - 1].text += '<br>' + xmlEscape(data.msg);
     drawGameLog();
+    drawSettings();
 }
 
 var onGuns = function(data) {
@@ -345,6 +462,26 @@ var onInvestigator = function(data) {
           g.votelog.investigator[g.votelog.investigator.length - 1] = g.investigator;
           drawVoteLog();
       }
+}
+
+var onExcalibur = function(data) {
+      g.excalibur = data.player;
+      drawExcalibur();
+      if(g.excalibur !== null) {
+          var p = $('#player' + g.excalibur).position();
+          $('#excalibur-mark').animate({
+              left: p.left + excaliburOffsetX,
+              top: p.top + excaliburOffsetY,
+          });
+          
+          g.votelog.excalibur[g.votelog.excalibur.length - 1] = g.excalibur;
+          drawVoteLog();
+      }
+}
+
+var onExcalibured = function(data) {
+    g.votelog.excalibured[g.votelog.excalibured.length - 1] = data.player;
+    drawVoteLog();
 }
 
 var onAddGame = function(data) {
@@ -380,6 +517,85 @@ var onSubPlayer = function(data) {
     drawLobbyPlayers();
 }
 
+var onClaim = function(data) {
+    g.highlights3[data.id] = data.isClaim;
+    drawPlayers();
+    drawClaimButton();
+}
+
+var onReconnect = function() {
+    // $("#game-container").removeClass("hidden");
+    // $("#lobby-container").addClass("hidden");
+    resetGlobals();
+    drawPlayers();
+    drawMsgArea();
+    drawGameLog();
+    drawGuns();
+    drawInvestigator();
+    drawExcalibur();
+    $('#scoreboard').html('');
+    //$('#chat-text').html('<div class=current></div>');
+}
+
+var onBuzz = function(data) {
+    if (localStorage.buzz && JSON.parse(localStorage.buzz) && canBuzz) {
+        canBuzz = false;
+        if (localStorage.beep && JSON.parse(localStorage.beep)) {
+            $('#audio')[0].play();
+        }
+        if (localStorage.titleNotification && JSON.parse(localStorage.titleNotification) && !windowFocus) {
+            pageTitleNotification.off();
+            pageTitleNotification.on(""+data.player+" has " + data.buzzType + " you", 1000);
+        }
+        onAllChat({ player:'server', isPrivate: true, msg: data.player + " has " + data.buzzType + " you." });
+        setTimeout(function() { canBuzz = true; }, 15000);
+        sendData({ cmd:'allChat', msg:"/answerbuzz " + data.questionId + " success" });
+    }
+    else if (!canBuzz) {
+        sendData({ cmd:'allChat', msg:"/answerbuzz " + data.questionId + " recent" });
+    }
+    else {
+        sendData({ cmd:'allChat', msg:"/answerbuzz " + data.questionId + " notification" });
+    }
+}
+
+var onRoleChosen = function(data) {
+    if (data.canChoose) {
+        $(".choose-role-group").removeClass("hidden");
+    }
+    else if (data.canChoose !== undefined) {
+        $(".choose-role-group").addClass('hidden');
+    }
+    if (data.used) {
+        $(".choose-role").addClass("hidden");
+        $(".choose-role-desc").html(data.desc);
+        $(".choose-role-desc").removeClass("hidden");
+        if (data.isMe) {
+            $(".cancel-choose-role").removeClass("hidden");
+        }
+    }
+    else {
+        $(".choose-role").removeClass("hidden");
+        $(".choose-role-desc").addClass("hidden");
+        $(".cancel-choose-role").addClass("hidden");
+    }
+    if (data.numTokens !== undefined) {
+        $("#role-token-number").html(data.numTokens);
+    }
+}
+
+var onMute = function(data) {
+    sendAjaxTo({}, 'GET', 'server/mutes')
+        .done(function(data) {
+            mutedPlayers = data.names;
+        })
+}
+
+var onSetting = function(data) {
+    g.settings[data.name] = data.value;
+    drawSettings();
+}
+
 var handlers = {
     'join': onJoin,
     'leave': onLeave,
@@ -401,11 +617,19 @@ var handlers = {
     'gamelog': onGameLog,
     'guns': onGuns,
     'investigator': onInvestigator,
+    'excalibur': onExcalibur,
+    'excalibured': onExcalibured,
     '+game': onAddGame,
     '-game': onSubGame,
     'votelog': onVoteLog,
     '+player': onAddPlayer,
     '-player': onSubPlayer,
+    'claim': onClaim,
+    'reconnect':onReconnect,
+    'buzz': onBuzz,
+    'chooseRole': onRoleChosen,
+    'mute': onMute,
+    'setting': onSetting
 };
 
 var drawGames = function() {
@@ -416,12 +640,17 @@ var drawGames = function() {
         3: 'Basic',
         5: 'Hunter'
     };
+    var isRankedNames = {
+        true: 'Ranked',
+        false: 'Unranked'
+    };
     for (var i = 0; i < g.games.length; ++i) {
         html += 
             '<tr onclick="onJoinGame(' + g.games[i].id + ')">' +
                 '<td>' + g.games[i].id + '</td>' +
                 '<td>' + g.games[i].msg + '</td>' +
                 '<td>' + gameTypeNames[g.games[i].gameType] + '</td>' +
+                '<td>' + isRankedNames[g.games[i].isRanked] + '</td>' +
             '</tr>';
     }
     $('#games-list').html(html);
@@ -430,16 +659,40 @@ var drawGames = function() {
 var drawLobbyPlayers = function() {
     var html = '';
     var names = [];
+    var nameToId = {};
     for (var id in g.lobbyPlayers) {
         names.push(g.lobbyPlayers[id]);
+        nameToId[g.lobbyPlayers[id]] = id;
     }
     
     names = names.sort();
     for (var idx = 0; idx < names.length; ++idx) {
-        html += '<tr><td>' + xmlEscape(names[idx]) + '</td></tr>';
+        html += '<tr><td>' +
+                '<span>' + xmlEscape(names[idx]) +'</span>';
+        if (localStorage.mod && JSON.parse(localStorage.mod)) {
+            html +=
+                '<span class="dropdown pull-right">' +
+                  '<button class="btn btn-standard btn-mini dropdown-toggle" type="button" id="banMenu" data-toggle="dropdown" aria-haspopup="true" aria-expanded="true">' +
+                    '<span class="caret"></span>' +
+                  '</button>' +
+                  '<ul class="dropdown-menu" aria-labelledby="dropdownMenu1">' +
+                    '<li class="text-center"><b>User Ban</b></li>' +
+                    '<li onclick="ban('+nameToId[names[idx]]+', 60*60, 1)"><a href="#">1 hour</a></li>' +
+                    '<li onclick="ban('+nameToId[names[idx]]+', 60*60*24, 1)"><a href="#">1 day</a></li>' +
+                    '<li onclick="ban('+nameToId[names[idx]]+', 60*60*24*7, 1)"><a href="#">1 week</a></li>' +
+                    '<li onclick="ban('+nameToId[names[idx]]+', 60*60*24*7*52, 1)"><a href="#">1 year</a></li>' +
+                    '<li class="text-center"><b>IP Ban</b></li>' +
+                    '<li onclick="ban('+nameToId[names[idx]]+', 60*60, 2)"><a href="#">1 hour</a></li>' +
+                    '<li onclick="ban('+nameToId[names[idx]]+', 60*60*24, 2)"><a href="#">1 day</a></li>' +
+                    '<li onclick="ban('+nameToId[names[idx]]+', 60*60*24*7, 2)"><a href="#">1 week</a></li>' +
+                    '<li onclick="ban('+nameToId[names[idx]]+', 60*60*24*7*52, 2)"><a href="#">1 year</a></li>' +
+                  '</ul>' +
+                '</span>'
+        }
+        html += '</td></tr>';
     }
     
-    $('#player-list').html(html);
+    $('.player-list').html(html);
 }
 
 var drawGuns = function() {
@@ -467,13 +720,24 @@ var drawInvestigator = function() {
   $('#investigator-mark').click(onClickUserTile(g.investigator));
 }
 
+var drawExcalibur = function() {
+  var html = '';
+  var width = $('#game-field').width();
+  if (g.excalibur !== null) {
+      html += '<img id=excalibur-mark src="sword.png" style="position:absolute; top:' + 200 + 'px; left:' + (width / 2 - 50) + 'px"></div>';
+  }
+
+  $('#excalibur-field').html(html);
+  $('#excalibur-mark').click(onClickUserTile(g.excalibur));
+}
+
 var drawGameLog = function() {
     if (g.gamelogIdx < g.gamelogs.length) {
-        $('#gamelog-page').html(g.gamelogs[g.gamelogIdx].page);
-        $('#gamelog-text').html(g.gamelogs[g.gamelogIdx].text);
+        $('.gamelog-page').html(g.gamelogs[g.gamelogIdx].page);
+        $('.gamelog-text').html(g.gamelogs[g.gamelogIdx].text);
     } else {
-        $('#gamelog-page').html('');
-        $('#gamelog-text').html('');
+        $('.gamelog-page').html('');
+        $('.gamelog-text').html('');
     }
 }
 
@@ -516,12 +780,45 @@ var drawMsgArea = function() {
     }
 }
 
+var drawClaimButton = function() {
+    if (myId && g.highlights3[myId]) {
+        $("#claim").addClass("hidden");
+        $("#unclaim").removeClass("hidden");
+    }
+    else if (myId) {
+        $("#unclaim").addClass("hidden");
+        $("#claim").removeClass("hidden");
+    }
+}
+
+var drawSettings = function() {
+    // Set settings
+    $('#anon-mode').prop('checked', g.settings.anonMode);
+    $('.anon-category').val(g.settings.anonCategory);
+    // Disable or enable ability to set settings (leader and game hasen't started)
+    if (g.leader === myId && !g.gamelogs[0]) {
+        $('.setting').removeAttr('disabled');
+        $('.setting-dropdown').removeAttr('disabled');
+    }
+    else {
+        $('.setting').attr('disabled', 'disabled');
+        $('.setting-dropdown').attr('disabled', 'disabled');
+    }
+    // Show or hide subsettings
+    if (g.settings.anonMode) {
+        $('.anon-category').removeClass('hidden');
+    }
+    else {
+        $('.anon-category').addClass('hidden');
+    }
+}
+
 var generateButton = function(btnClass, choice) {
     if (typeof(choice) === 'string') {
         return "<button class='btn " + btnClass + "' onclick='onDismissChoose(\"" + choice + "\")'>" + choice + "</button> ";
     } else {
         return "<div class='btn-group'>" +
-            "<a class='btn dropdown-toggle' data-toggle='dropdown' href='#'>" + choice[0] + " <span class='caret'></span></a>" +
+            "<a class='btn btn-standard dropdown-toggle' data-toggle='dropdown' href='#'>" + choice[0] + " <span class='caret'></span></a>" +
             "<ul class='dropdown-menu'>" +
             choice.slice(1).map(function (i) { 
                 return  "<li><a onclick='onDismissChoose(\"" + i + "\")'>" + i + "</a></li>";
@@ -548,90 +845,112 @@ var drawVoteLog = function() {
             var reject = (g.votelog.reject[j].indexOf(id) >= 0) ? 'reject' : '';
             var onteam = (g.votelog.onteam[j].indexOf(id) >= 0) ? '<i class="icon-ok"></i>' : '';
             var investigator = (g.votelog.investigator[j] === id) ? '<i class="icon-question-sign"></i>' : '';
-            html += '<td class="' + approve + ' ' + reject + ' ' + leader + '">' + onteam + ' ' + investigator + '</td>';
+            var excalibur = (g.votelog.excalibur[j] === id) ? '<i class="icon-wrench"></i>' : '';
+            var excalibured = (g.votelog.excalibured[j] === id) ? '<i class="icon-resize-horizontal"></i>' : '';
+            html += '<td class="' + approve + ' ' + reject + ' ' + leader + '">' + onteam + ' ' + investigator + ' ' + excalibur + ' ' + excalibured + '</td>';
         }
         html += '</tr>';
     }
     html += '</table>';
 
-    $('#votelog').html(html);
+    $('.votelog').html(html);
 }
 
 var drawPlayers = function(data) {
-    var round = Math.min(g.scoreboard.round || 1, 5);
-    for (var i = 0; i < g.players.length; ++i) {
-        if (g.players[i].id === g.leader) {
-            var hammer = g.players[(i + 5 - round) % g.players.length].id;
+        var round = Math.min(g.scoreboard.round || 1, 5);
+        for (var i = 0; i < g.players.length; ++i) {
+            if (g.players[i].id === g.leader) {
+                var hammer = g.players[(i + 5 - round) % g.players.length].id;
+            }
         }
-    }
 
-    var html = "";
-    var takeMode = 
-        g.choices.length > 0 &&
-        g.choices[g.choiceIdx].cmd === 'chooseTakeCard';
-        
-    for (var i = 0; i < g.players.length; ++i) {
-        var name = g.players[i].name;
-        var id = g.players[i].id;
-        var isOpinionMaker = g.cards.filter(function(c) { return c.player === id && c.card === 'OpinionMaker' }).length > 0;
-        var cards = g.cards
-            .filter(function (c) { return c.player === id; })
-            .map(function (c) { 
-                var showButton = takeMode && g.choices[g.choiceIdx].players.indexOf(id) !== -1;
-                return "<div class=media>" +
-                        (showButton ? "<button class='pull-left btn btn-success btn-mini' onclick='onDismissChoose({ player:" + id + ", card:\"" + c.card + "\" })'>Take</button>" : "") +
-                        "<div class=media-body>" + cardNames[c.card] + "</div>" +
-                    "</div>"; 
-            });
-        
-        var cardsPopover = "<div class=normal-word-break style='width:200px'>" + cards.join('') + "</div>";
-        var cardsTooltip = "<div class=normal-word-break>" + name + " has plot cards. Click for details.</div>";
-        var cardsIcon = 
-            "<span class=plot-cards data-html=true title=\"" + xmlEscape(cardsTooltip) + "\">" +
-                "<span data-html=true title='<b>Plot cards</b>'  data-content=\"" + xmlEscape(cardsPopover) + "\">" +
-                    "<i class=icon-book></i>" +
-                "</span>" +
-            "</span>";
-        
-        var opinionMakerTooltip = "<div class=normal-word-break>" + name + " is an Opinion Maker.</div>";
-        var opinionMakerIcon = "<span class=opinion-maker><i class=icon-share data-html=true title=\"" + xmlEscape(opinionMakerTooltip) + "\"></i></span>";
-        
-        var hammerTooltip = "<div class=normal-word-break>" + name + " is the hammer.</div>";
-        var hammerIcon = "<span class=hammer><i class=icon-star-empty data-html=true title=\"" + xmlEscape(hammerTooltip) + "\"></i></span>";
-        
-        var labelColor = "";
-        var labelText = g.players[i].role || "";
-        if (labelText === "Resistance" || labelText === "Spy") {
-            labelText = "";
+        var html = "";
+        var takeMode = 
+            g.choices.length > 0 &&
+            g.choices[g.choiceIdx].cmd === 'chooseTakeCard';
+            
+        for (var i = 0; i < g.players.length; ++i) {
+            var name = g.players[i].name;
+            var id = g.players[i].id;
+            var isOpinionMaker = g.cards.filter(function(c) { return c.player === id && c.card === 'OpinionMaker' }).length > 0;
+            var cards = g.cards
+                .filter(function (c) { return c.player === id; })
+                .map(function (c) { 
+                    var showButton = takeMode && g.choices[g.choiceIdx].players.indexOf(id) !== -1;
+                    return "<div class=media>" +
+                            (showButton ? "<button class='pull-left btn btn-success btn-mini' onclick='onDismissChoose({ player:" + id + ", card:\"" + c.card + "\" })'>Take</button>" : "") +
+                            "<div class=media-body>" + cardNames[c.card] + "</div>" +
+                        "</div>"; 
+                });
+            
+            var cardsPopover = "<div class=normal-word-break style='width:200px'>" + cards.join('') + "</div>";
+            var cardsTooltip = "<div class=normal-word-break>" + name + " has plot cards. Click for details.</div>";
+            var cardsIcon = 
+                "<span class=plot-cards data-html=true title=\"" + xmlEscape(cardsTooltip) + "\">" +
+                    "<span data-html=true title='<b>Plot cards</b>'  data-content=\"" + xmlEscape(cardsPopover) + "\">" +
+                        "<i class='icon-book icon-dark-white'></i>" +
+                    "</span>" +
+                "</span>";
+            
+            var opinionMakerTooltip = "<div class=normal-word-break>" + name + " is an Opinion Maker.</div>";
+            var opinionMakerIcon = "<span class=opinion-maker><i class=icon-share data-html=true title=\"" + xmlEscape(opinionMakerTooltip) + "\"></i></span>";
+            
+            var hammerTooltip = "<div class=normal-word-break>" + name + " is the hammer.</div>";
+            var hammerIcon = "<span class=hammer><i class='icon-star-empty icon-dark-white' data-html=true title=\"" + xmlEscape(hammerTooltip) + "\"></i></span>";
+            
+            var labelColor = "";
+            var role = g.players[i].role || "";
+            var role2 = g.players[i].role2 || "";
+            var tooltipText = role;
+            if (role2 !== "") {
+                tooltipText = role2 + " " + role;
+            }
+            var labelText = tooltipText;
+            if (role === "Resistance" || role === "Spy") {
+                labelText = role2;
+            }
+            if (g.votes[id] != null) {
+                labelText = g.votes[id];
+                labelColor = (g.votes[id] === 'Approve' ? 'label-success' : 'label-important');
+            }
+
+            var avatarImage = g.players[i].isSpy ? g.players[i].spyImg : g.players[i].resImg;
+            if (localStorage.originalAvatars && JSON.parse(localStorage.originalAvatars)) {
+                avatarImage = g.players[i].isSpy ? 'spy.png' : 'resistance.png';
+            }
+
+            var highlight = g.highlights[id];
+            var highlight3 = (g.highlights3[id] && !g.highlights[id]);
+            var highlight2 = (localStorage.highlight && JSON.parse(localStorage.highlight) && g.highlights2[id] && !highlight);
+            var highlight4 = highlight3 && highlight2;
+            if (highlight4) { highlight3 = false; highlight2 = false; };
+            html += "<div data-toggle='tooltip' title='"+tooltipText+"' id=player" + id + " class='usertile role_tooltip" + (g.highlights[id] ? ' highlight' : '') + (highlight2 ? ' highlight2' : '') + (highlight3 ? ' highlight3' : '') + (highlight4 ? ' highlight4' : '') + "'>" +
+                    "<img src='" + avatarImage + "''>" + // image
+                    "<br>" + (cards.length !== 0 ? cardsIcon : '') + // cards
+                    " <span id='"+id+"-name' class=player_name '"+(highlight3 ? ' claim':'')+"'>" + name + "</span> " + // name
+                    (isOpinionMaker ? opinionMakerIcon : '') + (hammer === id ? hammerIcon : '') + // hammer
+                    "<br><span class='label " + labelColor + "'>" + labelText + "</span>&nbsp;" + // label
+                    "</div>";
         }
-        if (g.votes[id] != null) {
-            labelText = g.votes[id];
-            labelColor = (g.votes[id] === 'Approve' ? 'label-success' : 'label-important');
+        
+        if (g.players.length > 0) {
+            html += "<img id=leader-star src=leader.png style='position:absolute'>";
         }
         
-        html += "<div id=player" + id + " class='usertile" + (g.highlights[id] ? ' highlight' : '') + "'>" +
-                "<img src=" + (g.players[i].isSpy ? 'spy' : 'resistance') + ".png>" +                
-                "<br>" + (cards.length !== 0 ? cardsIcon : '') + ' ' + name + ' ' + (isOpinionMaker ? opinionMakerIcon : '') + (hammer === id ? hammerIcon : '') +
-                "<br><span class='label " + labelColor + "'>" + labelText + "</span>&nbsp;" +
-                "</div>";
+        $('#game-field').html(html);
+        for (var i = 0; i < g.players.length; ++i) {
+            $('#player' + g.players[i].id + ' img').click(onClickUserTile(g.players[i].id));
+            $('#player' + g.players[i].id + ' .plot-cards').tooltip({placement: 'bottom'});
+            $('#player' + g.players[i].id + ' .opinion-maker i').tooltip({placement: 'bottom'});
+            $('#player' + g.players[i].id + ' .plot-cards span').popover({placement: 'top'});
+            $('#'+g.players[i].id+"-name").click(onClickUserName(g.players[i].id));
+        }
+        
+        $('span.hammer i').tooltip({placement: 'bottom'});
+        $('.role_tooltip').tooltip({placement: 'top'});
+        
+        arrangePlayers();
     }
-    
-    if (g.players.length > 0) {
-        html += "<img id=leader-star src=leader.png style='position:absolute'>";
-    }
-    
-    $('#game-field').html(html);
-    for (var i = 0; i < g.players.length; ++i) {
-        $('#player' + g.players[i].id + ' img').click(onClickUserTile(g.players[i].id));
-        $('#player' + g.players[i].id + ' .plot-cards').tooltip({placement: 'bottom'});
-        $('#player' + g.players[i].id + ' .opinion-maker i').tooltip({placement: 'bottom'});
-        $('#player' + g.players[i].id + ' .plot-cards span').popover({placement: 'top'});
-    }
-    
-    $('span.hammer i').tooltip({placement: 'bottom'});
-    
-    arrangePlayers();
-}
 
 var arrangePlayers = function(data) {
     if (g.players.length === 0) {
@@ -640,11 +959,13 @@ var arrangePlayers = function(data) {
     
     var itemWidth = $('#player' + g.players[0].id).width();
     var fieldWidth = $('#game-field').parent().width();
-    var fieldHeight = 500;
+    // var fieldHeight = 500;
+    var fieldHeight = $('#game-field').parent().height();
     var points = pointsOnAnEllipse(fieldWidth * 0.8, fieldHeight * 0.6, g.players.length);
     for (var i = 0; i < g.players.length; ++i) {
         g.players[i].x = points[i].x + fieldWidth / 2 - itemWidth / 2;
-        g.players[i].y =  points[i].y + 160;
+        // g.players[i].y =  points[i].y + 160;
+        g.players[i].y = points[i].y + .6 * fieldHeight / 2 + 10;
         $('#player' + g.players[i].id)
             .css('left', g.players[i].x)
             .css('top',  g.players[i].y);
@@ -660,6 +981,12 @@ var arrangePlayers = function(data) {
             $('#investigator-mark')
                 .css('left', g.players[i].x + investigatorOffsetX)
                 .css('top',  g.players[i].y);
+        }
+
+        if (g.excalibur === g.players[i].id) {
+            $('#excalibur-mark')
+                .css('left', g.players[i].x + excaliburOffsetX)
+                .css('top',  g.players[i].y + excaliburOffsetY);
         }
     }
     
@@ -719,23 +1046,94 @@ var xmlEscape = function(s) {
         .replace(/"/g, '&quot;');
 }
 
-var updateChat = function(selector, data) {
-    var currentDiv = selector.children(".current");
-    var lines = (currentDiv.data("lines") || 0) + 1;
-    currentDiv.append(
-        "<code>[" + new Date().toTimeString().substring(0, 5) + "]</code> " +
-        "<span style='" + (data.serverMsg ? "color: teal" : "") + "'>" +
-        "<b>" + xmlEscape(data.player) + "</b>: " + 
-        xmlEscape(data.msg) + "</span><br>");
-    currentDiv.data("lines", lines);
-    
-    if (lines >= 10) {
-        var innerHtml = currentDiv.html();
-        currentDiv.remove();
-        selector.append("<div>" + innerHtml + "</div><div class='current'></div>");
-    }
+var urlify = function(text) {
+    var urlRegex = /(https?:\/\/[^\s]+)/g;
+    return text.replace(urlRegex, function(url) {
+        return '<a href="' + url + '" target="_blank">' + url + '</a>';
+    })
+    // or alternatively
+    // return text.replace(urlRegex, '<a href="$1">$1</a>')
+}
 
-    selector.prop({scrollTop: selector.prop('scrollHeight')});
+var getId = function(name) {
+    var players = g.players.filter(function(obj) { return obj.name.toLowerCase() === name.toLowerCase(); })
+    if (players.length > 0) {
+        return players[0].id;
+    }
+    return null;
+}
+
+var isMuted = function(name) {
+    for (var i = 0; i < mutedPlayers.length; i++) {
+        if (mutedPlayers[i].toLowerCase() === name.toLowerCase()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+var inGame = function(id) {
+    if (!id) return false;
+    for (var i = 0; i < g.players.length; i++) {
+        if (g.players[i].id === id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+var hideAnimationChatBelow = function(element) {
+    setTimeout(function() { 
+        element.css({ "border-bottom":"none" }); 
+    }, 1500);
+}
+
+var updateChat = function(selectors, data) {
+    var id = getId(data.player);
+    var highlight = id && g.textHighlights[id] && localStorage.highlightText && JSON.parse(localStorage.highlightText);
+    var msg = data.serverMsg ? urlify(data.msg) : urlify(xmlEscape(data.msg));
+    var player = data.serverMsg ? data.player : xmlEscape(data.player);
+    // color?
+    var color = "";
+    if (data.serverMsg) color = "color: teal;";
+    if (data.isPrivate) color = "color: gray;";
+    if (data.privateMsg) color = "color: blue;";
+
+    selectors.each(function(i, element) {
+        selector = $(element);
+        var currentDiv = selector.children(".current");
+        var lines = (currentDiv.data("lines") || 0) + 1;
+        var lineToAppend = "";
+        if (data.custom) {
+            lineToAppend = msg;
+        }
+        else {
+            lineToAppend = "<code>[" + new Date().toTimeString().substring(0, 5) + "]</code> " +
+                            "<span style='" + color + "'" +
+                                    "class='" + (id ? id+"-chat" : "") + (highlight ? " chat-highlight" : "") + "'>" +
+                            "<b>" + player + "</b>: " + 
+                            msg + "</span>" + (data.noBreak ? "" : "<br>")
+        }
+        currentDiv.append(lineToAppend);
+        currentDiv.data("lines", lines);
+        if (lines >= 10) {
+            var innerHtml = currentDiv.html();
+            currentDiv.remove();
+            selector.append("<div>" + innerHtml + "</div><div class='current'></div>");
+        }
+
+        var shouldScroll = false;
+        if (selector.prop("scrollTop") + selector.height() + 50 >= selector.prop('scrollHeight'))
+        {
+            shouldScroll = true;
+        }
+        if(shouldScroll){
+            selector.prop({scrollTop: selector.prop('scrollHeight')});
+        }else{
+            selector.css({"border-bottom":"3px dashed red"});
+            hideAnimationChatBelow(selector);
+        }
+    });
 }
 
 var getHighlights = function() {
@@ -744,10 +1142,44 @@ var getHighlights = function() {
         .map(function(i) { return parseInt(i, 10); });
 }
 
-var sendAjax = function(x, verb) {
+var sendAjax = function(x, verb, poll) {
     //debugLog.push({ dir:'OUT', verb:verb, body:x });
+
     return $.ajax(
         '/server/play', { 
+        cache: false,
+        type: verb || 'POST', 
+        processData: false,
+        contentType: 'application/json',
+        data: x == null ? '' : JSON.stringify(x) })
+    .fail(function(xmlHttpRequest, code, error)
+    {
+        if (xmlHttpRequest.status === 401) {
+            window.alert('There was a network error. Please log back in.\n\n' + code + '\n' + error + '\n' + xmlHttpRequest.responseText);
+            window.location = '/';  
+        }
+        else {
+            if (code === "timeout" && poll) {
+                return pollLoop();
+            }
+            // onChat({player:"", serverMsg:false, msg:"You have disconnected. You may be missing some chat."});
+            setTimeout(function() {sendAjax({cmd:'reconnect'}); if (poll) {pollLoop();}}, 2000);
+        }    
+    });
+}
+
+var sendData = function(data) {
+    if (socket) {
+        socket.emit('play', data);
+    }
+    else {
+        sendAjax(data);
+    }
+}
+
+var sendAjaxTo = function(x, verb, location) {
+    return $.ajax(
+        location, { 
         type: verb || 'POST', 
         processData: false,
         contentType: 'application/json',
@@ -758,9 +1190,15 @@ var sendAjax = function(x, verb) {
         window.location = '/';        
     });
 }
+var ban = function(playerId, duration, banType) {
+    sendAjaxTo({ playerId:playerId, duration:duration, banType:banType }, 'POST', '/server/ban')
+        .done(function(data) {
+        })
+}
 
 var pollLoop = function() {
-    sendAjax(null, "GET")
+    var num = pollNum;
+    sendAjax(null, "GET", true)
         .done(function(data) {
             //debugLog.push({ dir:'IN', verb:'GET' });
             for (var i = 0; i < data.length; ++i) {
@@ -771,10 +1209,13 @@ var pollLoop = function() {
                         handler(data[i]);
                     } catch (e) {
                         sendAjax({ cmd: 'clientCrash', exception:e, msg:data[i] });
+                        setTimeout(function() {sendAjax({cmd:'reconnect'});}, 2000);
                     }
                 }
             }
-            pollLoop();
+            if (pollNum === num) {
+                pollLoop();
+            }
         });
 }
 
@@ -790,40 +1231,91 @@ var unhighlightTab = function(selector) {
     }
 }
 
-var scrollToBottom = function(selector) {
+var scrollToBottom = function(selectors) {
     return function() {
-        $(selector).prop({scrollTop: $(selector).prop('scrollHeight')});
+        $(selectors).each(function(i, selector) {
+            $(selector).prop({scrollTop: $(selector).prop('scrollHeight')});
+        });
     }
+}
+
+var resizeElements = function(fieldHeight) {
+    // TODO:
+    $('#scoreboard').css('top', .6 * fieldHeight / 2 + 25);
+    var windowScroll = $(window).scrollTop() + $(window).height();
+    var gameBottom = $('#game-container').height() + $('#game-container').position().top + 20;
+    $('.resizable').each(function(index, element) {
+        var newHeight = $(this).height() + (windowScroll - gameBottom);
+        if (newHeight > parseInt($(this).attr('data-min-height'))) {
+            $(this).height(newHeight);
+        }
+        else {
+            $(this).height(parseInt($(this).attr('data-min-height')));
+        }
+    });
 }
 
 // On page load ...
 $(function() {
     var game_field_width = $('#game-field').width();
+    var game_field_height = $('#game-field').parent().height();
     setInterval(function() {
         var w = $('#game-field').width();
-        if (w !== game_field_width) {
+        var h = $('#game-field').parent().height();
+        if (w !== game_field_width || h !== game_field_height) {
             arrangePlayers();
+            resizeElements(h);
         }
         game_field_width = w;
+        game_field_height = h;
     }, 100);
+    $('#settings-dialog').dialog({ autoOpen: false, modal: true });
+    $(document).on('click', '.ui-widget-overlay', function () {
+        $('.dialog').dialog('close');
+    });
     
-    $('#all-chat-nav-tab')
-        .click(unhighlightTab('#all-chat-nav-tab'))
-        .on('shown', scrollToBottom('#all-chat-text'));
-    $('#chat-nav-tab')
-        .click(unhighlightTab('#chat-nav-tab'))
-        .on('shown', scrollToBottom('#chat-text'));
-    $('#new-game-original').click(onCreateGame(1));
-    $('#new-game-avalon').click(onCreateGame(2));
-    $('#new-game-basic').click(onCreateGame(3));
-    $('#new-game-hunter').click(onCreateGame(5));
+    $('.all-chat-nav-tab')
+        .click(unhighlightTab('.all-chat-nav-tab'))
+        .on('shown', scrollToBottom('.all-chat-text'));
+    $('.chat-nav-tab')
+        .click(unhighlightTab('.chat-nav-tab'))
+        .on('shown', scrollToBottom('.chat-text'));
+    $('#new-game-original').click(onCreateGame(1,false));
+    $('#new-game-avalon').click(onCreateGame(2,false));
+    $('#new-game-basic').click(onCreateGame(3,false));
+    $('#new-game-hunter').click(onCreateGame(5,false));
+    $('#new-game-trump').click(onCreateGame(2,false,2));
+    $('#new-game-original-r').click(onCreateGame(1,true));
+    $('#new-game-avalon-r').click(onCreateGame(2,true));
+    $('#new-game-basic-r').click(onCreateGame(3,true));
+    $('#new-game-hunter-r').click(onCreateGame(5,true));
     $('#leave-game').click(onLeaveGame);
-    $('#prev-gamelog').click(onPrevGameLog);
-    $('#next-gamelog').click(onNextGameLog);
-    $('#chat-input').keypress(onEnter('chat'));
+    $('.prev-gamelog').click(onPrevGameLog);
+    $('.next-gamelog').click(onNextGameLog);
+    $('.chat-input').keypress(onEnter('chat'));
     $('#lobby-chat-input').keypress(onEnter('allChat'));
-    $('#all-chat-input').keypress(onEnter('allChat'));
+    $('.all-chat-input').keypress(onEnter('allChat'));
+    $('#claim').click(onClickClaim(true));
+    $('#unclaim').click(onClickClaim(false));
+    $('.poll-button').click(onClickPoll());
+    $('.role-choice').click(onClickRoleChoice(false));
+    $('.cancel-choose-role').click(onClickRoleChoice(true));
+    $('.settings').click(onClickSettings);
+    $('.setting').on('click', onClickSetting());
+    $('.setting-dropdown').on('change', onChangeSetting());
+
+    $('.autocomplete-input').keydown(function(event) {
+        if (event.keyCode !== 9) return true; // Not tab?
+        autocomplete($(this), objectToArray(g.lobbyPlayers));
+        return false;
+    });
+    $('#field-container').resizable({ handles: "s", maxHeight: 500, minHeight: 370 });
     
     pollLoop();
-    sendAjax({cmd:'refresh'});
+    sendData({cmd:'refresh'});
+
+    initOptionsJS();
+    initDiscussions();
+    initNotifications();
+
 });

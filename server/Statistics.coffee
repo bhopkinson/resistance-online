@@ -1,8 +1,26 @@
+# Threads = require 'webworker-threads'
+
 class Statistics
     constructor: (@db) ->
-        @refresh()
         @stats = {}
-        setInterval (=> @refresh()), 15 * 60 * 1000
+        @tables = {}
+        # setInterval (=> @refresh()), 4 * 60 * 60 * 1000
+        @statsWorkers = new StatisticsWorkers()
+        @statsWorker = @statsWorkers.newWorker()
+        @statsWorker.onmessage = (e) =>
+            @tables = e.data
+            @stats = 
+                activeplayers: @getActivePlayers(@tables)
+                leaderboard: @getLeaderboard(@tables)
+                recentgames: @getRecentGames(@tables)
+                winrates: @getWinRates(@tables)
+                activity: @getActivity(@tables)
+                ratings: @getRatings(@tables)
+                ratings2: @getRatings2(@tables)
+            @tables = e.data.tables
+            @stats = e.data.stats
+        @refresh()
+
         
     get: (param) ->
         return @stats[param] or "not found: #{param}"
@@ -10,14 +28,18 @@ class Statistics
     refresh: ->
         @db.getTables (err, tables) =>
             return if err?
-            @joinTables(tables)
-            @stats = 
-                activeplayers: @getActivePlayers(tables)
-                leaderboard: @getLeaderboard(tables)
-                recentgames: @getRecentGames(tables)
-                winrates: @getWinRates(tables)
-                activity: @getActivity(tables)
-            
+            @statsWorker.postMessage(tables)
+            # @joinTables(tables)
+            # @tables = tables
+            # @stats = 
+            #     activeplayers: @getActivePlayers(@tables)
+            #     leaderboard: @getLeaderboard(@tables)
+            #     recentgames: @getRecentGames(@tables)
+            #     winrates: @getWinRates(@tables)
+            #     activity: @getActivity(@tables)
+            #     ratings: @getRatings(@tables)
+            #     ratings2: @getRatings2(@tables)
+
     joinTables: (tables) ->
         oneMonthAgo = Date.now() - 30 * 24 * 3600 * 1000
 
@@ -26,7 +48,7 @@ class Statistics
             game.spies = []
             game.resistance = []
             gameIdx[game.id] = game
-        
+
         playerIdx = {}
         for player in tables.players
             player.lastMonthGames = 0
@@ -42,6 +64,11 @@ class Statistics
             game = gameIdx[gameplayer.gameId]
             which = if gameplayer.isSpy then game.spies else game.resistance
             which.push playerIdx[gameplayer.playerId]
+
+        for ratings in tables.ratings1
+            playerIdx[ratings.id].ratings1 = ratings
+        for ratings in tables.ratings2
+            playerIdx[ratings.id].ratings2 = ratings
         
         for game in tables.games
             for player in game.spies
@@ -73,11 +100,12 @@ class Statistics
             .sort((a,b) -> a.name.toLowerCase().localeCompare(b.name.toLowerCase()))
             
         for player in filteredPlayers
-            html += "<tr>" +
-                "<td>#{player.name}</td> " +
-                "<td>#{@frac(player.resistanceWins, player.resistanceGames)}</td> " +
-                "<td>#{@frac(player.spyWins, player.spyGames)}</td> " +
-                "<td>#{@frac(player.spyWins + player.resistanceWins, player.spyGames + player.resistanceGames)}</td></tr>"
+            if not player.stats_hidden
+                html += "<tr>" +
+                    "<td>#{player.name}</td> " +
+                    "<td>#{@frac(player.resistanceWins, player.resistanceGames)}</td> " +
+                    "<td>#{@frac(player.spyWins, player.spyGames)}</td> " +
+                    "<td>#{@frac(player.spyWins + player.resistanceWins, player.spyGames + player.resistanceGames)}</td></tr>"
                 
         html += "</table>"
         return html
@@ -148,7 +176,63 @@ class Statistics
         
         html = "<script>drawChart([['Date', 'Weekly Games', 'Player Hours', 'Unique Players'], #{rows.join('')}]);</script>"
         return html
+
+    getRatings: (tables) ->
+        oneMonthAgo = Date.now() - 30 * 24 * 3600 * 1000
+        html = "<table id='ratingsTable' class='table table-striped table-condensed'>"
+        html += "<colgroup>
+           <col span='1' style='width: 22%;'>
+           <col span='1' style='width: 26%;'>
+           <col span='1' style='width: 26%;'>
+           <col span='1' style='width: 26%;'>
+          </colgroup>"
+        html += "<tr><th>Player</th><th>Resistance</th><th>Spy</th><th>Overall</th></tr>"
+
+        filteredPlayers = tables.players
+            .filter((i) -> i.lastGame.getTime() > oneMonthAgo)
+        for player in filteredPlayers.sort((a, b) -> b.ratings1.overall - a.ratings1.overall)
+            if player.ratings1.num_games > 15 and not player.stats_hidden
+                ratings = player.ratings1
+                color = "hsl(0,0%,#{if ratings.num_games < 250 then (100-(100*(ratings.num_games/312.5)+20))+"%" else "0%"})"
+                html += "<tr style='color:#{color};'><td>#{player.name}</td><td>#{ratings.res}</td><td>#{ratings.spy}</td><td>#{ratings.overall}</td></tr>"
+        
+        html += "</table>"
+        return html
+
+    getRatings2: (tables) ->
+        oneMonthAgo = Date.now() - 30 * 24 * 3600 * 1000
+        html = "<table id='ratingsTable2' class='table table-striped table-condensed'>"
+        html += "<colgroup>
+           <col span='1' style='width: 22%;'>
+           <col span='1' style='width: 26%;'>
+           <col span='1' style='width: 26%;'>
+           <col span='1' style='width: 26%;'>
+          </colgroup>"
+        html += "<tr><th>Player</th><th>Resistance</th><th>Spy</th><th>Overall</th></tr>"
+
+        filteredPlayers = tables.players
+            .filter((i) -> i.lastGame.getTime() > oneMonthAgo)
+        for player in filteredPlayers.sort((a, b) -> b.ratings2.overall - a.ratings2.overall)
+            if player.ratings2.num_games > 0 and not player.stats_hidden
+                ratings = player.ratings2
+                # color = "hsl(0,0%,#{if ratings.num_games < 250 then (100-(100*(ratings.num_games/312.5)+20))+"%" else "0%"})"
+                color = "hsl(0,0%,0%)"
+                html += "<tr style='color:#{color};'><td>#{player.name}</td><td>#{ratings.res}</td><td>#{ratings.spy}</td><td>#{ratings.overall}</td></tr>"
+        
+        html += "</table>"
+        return html
         
     frac: (n, d) ->
         pct = if d is 0 then 0 else 100 * n / d
         return "#{pct.toFixed(1)}% (#{n} / #{d})"
+
+    playerStats: (playerName, cb) ->
+        players = @tables.players.filter((i) -> i.name.toLowerCase() is playerName.toLowerCase())
+        return cb("No matching players.") if players.length is 0
+        player = players[0]
+        return cb null,
+            name: player.name
+            resistance: @frac(player.resistanceWins, player.resistanceGames)
+            spy: @frac(player.spyWins, player.spyGames)
+            all: @frac(player.spyWins + player.resistanceWins, player.spyGames + player.resistanceGames)
+            stats_hidden: player.stats_hidden

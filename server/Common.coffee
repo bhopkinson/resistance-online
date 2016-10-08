@@ -16,6 +16,9 @@ defineMethod Array, 'shuffle', ->
         j = Math.floor(Math.random() * (@.length - i) + i)
         [@[i], @[j]] = [@[j], @[i]]
 
+defineMethod String, 'trim', ->
+    return String(this).replace(/^\s+|\s+$/g, '')
+
 ORIGINAL_GAMETYPE = 1
 AVALON_GAMETYPE = 2
 BASIC_GAMETYPE = 3
@@ -28,6 +31,12 @@ HUNTER_GAMETYPE = 5
 HUNTER_PLUS_GAMETYPE = 6
 
 allGameTypes = [ORIGINAL_GAMETYPE, AVALON_GAMETYPE, BASIC_GAMETYPE, HUNTER_GAMETYPE]
+
+gameTypeNames =
+    1: 'Original'
+    2: 'Avalon'
+    3: 'Basic'
+    5: 'Hunter'
 
 xmlEscape = (s) ->
     return s
@@ -43,6 +52,8 @@ xmlEscape = (s) ->
 g =
     playersById: {}
     playersBySessionKey: {}
+    mutedPlayers: []
     # db: new Database()
     # stats: new Statistics()
     # lobby: new Lobby()
+    # specialMode: 0

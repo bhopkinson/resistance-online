@@ -3,7 +3,8 @@
   <head>
     <title>Online Game: The Resistance</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <link href="bootstrap/css/bootstrap.min.css" rel="stylesheet" media="screen">
+    <link href="lib/bootstrap/css/bootstrap.min.css" rel="stylesheet" media="screen">
+    <script src='https://www.google.com/recaptcha/api.js'></script>
   </head>
   <body>
     <div class='navbar navbar-inverse navbar-static-top'>
@@ -22,8 +23,8 @@
                     <li><a href='rules.html'>Rules</a></li>
                     <li><a href='about.html'>About</a></li>
                     <li><a href='stats.html'>Statistics</a></li>
-                    <li><a href='https://github.com/cashto/resistance'>GitHub</a></li>
-                    <li><a href='https://www.facebook.com/theresistanceonlineavalon'>Facebook</a></li>
+                    <li><a href='https://github.com/zdsj/resistance'>GitHub</a></li>
+                    <li><a href='https://www.facebook.com/groups/1788396528083787/'>Facebook</a></li>
                 </ul>
             </div>
         </div>
@@ -57,17 +58,16 @@
                     </div>
                 </p>
                 
-                <script>var RecaptchaOptions = { theme : 'clean' }; </script>
-                <script src="http://www.google.com/recaptcha/api/challenge?k=6LdBd-MSAAAAAPcRQwQC6N6vk-6Fmxlxq6C4KIK1"></script>
-                <p></p>
+                <div class="g-recaptcha" data-sitekey="6LdVmBETAAAAANjNfY-OpHUUIEqunQCfwcY_r9Yo"></div>
+                <br>
                 
                 <button id=registerBtn class="btn btn-primary" type="button">Register!</button>
             </div>
         </div>
     </div>
     
-    <script src="jquery-1.10.1.min.js"></script>
-    <script src="bootstrap/js/bootstrap.min.js"></script>
+    <script src="lib/jquery-1.10.1.min.js"></script>
+    <script src="lib/bootstrap/js/bootstrap.min.js"></script>
     <script src="login.js"></script>
     <script>
         $(function() {
@@ -81,8 +81,9 @@
                         password1: $('#regpassword1').val(),
                         password2: $('#regpassword2').val(),
                         email: $('#regemail').val(),
-                        challenge: $('#recaptcha_challenge_field').val(),
-                        response: $('#recaptcha_response_field').val()
+                        //challenge: $('#recaptcha_challenge_field').val(),
+                        //response: $('#recaptcha_response_field').val()
+                        response: grecaptcha.getResponse()
                     })
                 })
                 .done(function () {
@@ -90,7 +91,7 @@
                     window.location = 'index.html';
                 })
                 .fail(function (xhr) {
-                    Recaptcha.reload();
+                    grecaptcha.reset();
                     window.alert('Registration failed: ' + xhr.responseText);
                 });        
             });

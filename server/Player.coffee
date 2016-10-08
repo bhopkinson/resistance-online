@@ -1,9 +1,10 @@
 class Player
-    constructor: (@name, @id, @sessionKey, @room) ->
+    constructor: (@name, @id, @resImg, @spyImg, @avatarEnabled, @roleTokens, @sessionKey, @room) ->
         @connection = null
         @lastConnectTime = Date.now()
         @pendingMessages = []
         @room.onPlayerJoin(this)
+        @socket = null
     
     setRoom: (newRoom) ->
         @room.onPlayerLeave(this)
@@ -16,6 +17,7 @@ class Player
             
     send: (cmd, params = {}) ->
         params.cmd = cmd
+        return @socket.emit('play', params) if @socket?
         @pendingMessages.push(params)
         
     sendMsg: (msg) ->

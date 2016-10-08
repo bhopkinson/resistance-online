@@ -1,5 +1,5 @@
 class Game extends Room
-    constructor: (@id, @gameType, @lobby, @db) ->
+    constructor: (@id, @gameType, @isRanked, @lobby, @db) ->
         super
             'leave': @onLeave
             'chat': @onChat
@@ -8,6 +8,10 @@ class Game extends Room
             'choosePlayers': @onChoosePlayers
             'chooseTakeCard': @onChooseTakeCard
             'refresh': @onRefresh
+            'reconnect': @onReconnect
+            'claim': @onClaim
+            'chooseRole': @onChooseRole
+            'setting': @onSetting
         @nextId = 1
         @leader = 0
         @activePlayers = []
@@ -23,6 +27,7 @@ class Game extends Room
         @score = []
         @guns = []
         @investigator = null
+        @excalibur = null
         @cardName =
             KeepingCloseEye: 'KEEPING A CLOSE EYE ON YOU'
             EstablishConfidence: 'ESTABLISH CONFIDENCE'
@@ -35,6 +40,8 @@ class Game extends Room
             OpinionMaker: 'OPINION MAKER'
             LadyOfTheLake: 'LADY OF THE LAKE'
             Inquisitor: 'INQUISITOR'
+        @defaultResImg = 'avatars/base-res.png'
+        @defaultSpyImg = 'avatars/base-spy.png'
         @removedPlayerIds = []
         @votelog =
             rounds: [0, 0, 0, 0, 0]
@@ -43,6 +50,8 @@ class Game extends Room
             reject: []
             onteam: []
             investigator: []
+            excalibur: []
+            excalibured: []
         @avalonOptions =
             usePercival: false
             useMorgana: false
@@ -58,16 +67,32 @@ class Game extends Room
             usePretender: false
             useBlame: false
             useInquisitor: false
+        @options = 
+            useExcalibur: false
+        @settings =
+            anonMode: false
+            anonCategory: "color"
         @ineligibleResHunterAccusees = []
         @ineligibleSpyHunterAccusees = []
         @spyHunterRevealed = false
         @resHunterRevealed = false
+        @quickdrawHasShot = false
         @startQuestionId = 1
+        @claims = {}
+        @spiesRequired = Math.floor((@activePlayers.length - 1) / 3) + 1
+        @startDay = (new Date()).getUTCDay()
+        @startHour = (new Date()).getUTCHours()
+        @rankedTime = (@startDay is 0 or @startDay is 3) and ((@startHour >= 10 and @startHour <= 12) or (@startHour >= 17 and @startHours <= 19))
+        @roleChoices = {}
+        @nameMap = {}
         
     onRequest: (player, request) ->
         if @dbId? and request.cmd not in ['chat', 'allChat']
-            @db.updateGame @dbId, ++@nextId, player.id, JSON.stringify(request), (err) ->
-                console.log err if err?
+            if request.cmd in ['chat'] and request.msg.length > 512
+                console.log 'Message length ( #{request.msg.length} ) exceeds max length.'
+            else
+                @db.updateGame @dbId, ++@nextId, player.id, JSON.stringify(request), (err) ->
+                    console.log err if err?
         super
         
     onPlayerJoin: (player) ->
@@ -75,7 +100,7 @@ class Game extends Room
         for p in @activePlayers when p.id is player.id
             p.__proto__ = player
         @onRefresh(player)
-        @onChat null, { msg: "#{player} has entered the game." }
+        @onChat null, { msg: "#{@nameOf(player)} has entered the game." }
         if @players.length is 1 then @addActivePlayer(player) else @askToJoinGame(player)
         
     onRefresh: (player) ->
@@ -90,13 +115,39 @@ class Game extends Room
         player.send 'gameover' if @gameFinished
         player.send 'guns', { players:@guns }
         player.send 'investigator', { player:@investigator }
+        player.send 'excalibur', { player:@excalibur }
         player.send 'votelog', @votelog
+        player.send 'claim', claim for playerId, claim of @claims
+        player.send 'setting', { name: name, value: value } for name, value of @settings
+        @sendChooseRole player
+        @sendLobbyPlayers player
+        player.flush()
+
+    onReconnect: (player) ->
+        player.send 'reconnect'
+        @sendPlayers player
+        player.send 'status', { msg:@status }
+        player.send('gamelog', log) for log in @log
+        player.send('+card', { player:card.player.id, card:card.card }) for card in @cards
+        player.send 'scoreboard', @getScoreboard() if @gameStarted
+        player.send 'leader', { player:@activePlayers[@leader].id } if @activePlayers.length > 0
+        player.send(q.question.cmd, q.question) for q in @questions when q.player.id is player.id
+        player.send 'gameover' if @gameFinished
+        player.send 'guns', { players:@guns }
+        player.send 'investigator', { player:@investigator }
+        player.send 'excalibur', { player:@excalibur }
+        player.send 'votelog', @votelog
+        player.send 'claim', claim for playerId, claim of @claims
+        player.send 'setting', { name: name, value: value } for name, value of @settings
+        @sendChooseRole player
+        @sendLobbyPlayers player
+        player.flush()
     
     onPlayerLeave: (player) ->
         super
 
         @cancelQuestions([player]) if not @gameStarted
-        @onChat null, { msg: "#{player} has left the game." }
+        @onChat null, { msg: "#{@nameOf(player)} has left the game." }
                          
         if player.id in @activePlayers.map((p)->p.id)
             if not @gameStarted
@@ -124,15 +175,24 @@ class Game extends Room
 #-----------------------------------------------------------------------------
         
     onChat: (player, request) ->
+        return if player? and player.name.toLowerCase() in g.mutedPlayers and not (player.name.toLowerCase() in g.options.mods)
+        if request.msg[0] is '/'
+            return g.commands.onCommand request.msg, 'chat', player
+        name = if player? then @nameOf(player) else 'server'
+        if @gameFinished and player? and @settings.anonMode and @nameMap[player.id]
+            name = "#{@nameMap[player.id]} - #{player.name}"
         for p in @players
             cmd =
-                player: (if player? then player.name else 'server')
+                player: name
                 msg: request.msg
             cmd.serverMsg = true if not player?
             cmd.isSpectator = player? and @gameStarted and not @gameFinished and not @activePlayers.some (i) -> i.id is player.id
             p.send 'chat', cmd
             
     onAllChat: (player, request) ->
+        return if player? and player.name.toLowerCase() in g.mutedPlayers and not (player.name.toLowerCase() in g.options.mods)
+        if request.msg[0] is '/'
+            return g.commands.onCommand request.msg, 'allChat', player
         @lobby.onAllChat(player, request)
             
     onLeave: (player, request) ->
@@ -168,6 +228,32 @@ class Game extends Room
         question = @findQuestion player, request
         return if not question?
         @answerQuestion question, { card:request.choice.card, player:@findPlayer(request.choice.player) }
+
+    onClaim: (player, request) ->
+        cmd = { id:player.id, isClaim:request.isClaim }
+        @claims[player.id] = cmd
+        @sendAll 'claim', cmd
+
+    onChooseRole: (player, request) ->
+        return if not @roleChoices[player.id] and Object.keys(@roleChoices).length > 0
+        return if @gameStarted or @isRanked
+        return if player.roleTokens < 1
+        return if not (player.id in @getIds(@activePlayers))
+        if request.cancel
+            @sendAll 'chooseRole', { used: false }
+            return @roleChoices = {}
+        @roleChoices[player.id] = request.role
+        @sendAll 'chooseRole', { used: true, desc: "A role has been chosen." }
+        player.send 'chooseRole', { isMe: true, used: true, desc: "You have chosen #{request.role}." }
+
+    onSetting: (player, request) ->
+        # TODO: Setting handlers
+        return if not (@activePlayers[@leader].id is player.id) or @gameStarted
+        return if not request.setting or not request.setting.name or request.setting.value is undefined
+        return if @settings[request.setting.name] is undefined
+        @settings[request.setting.name] = request.setting.value
+        @sendAll 'setting', request.setting
+
 
 #-----------------------------------------------------------------------------    
 # Primary game logic
@@ -209,9 +295,12 @@ class Game extends Room
         choices = ['OK', 'Remove player']
         choices.push(@getAvalonOptions()) if @gameType is AVALON_GAMETYPE
         choices.push(@getHunterOptions()) if @gameType is HUNTER_GAMETYPE
+        choices.push(@getOriginalOptions()) if @gameType is ORIGINAL_GAMETYPE
+        choices.push(@getBasicOptions()) if @gameType is BASIC_GAMETYPE
         message = "Press OK to start game"
         message += " with " + @getAvalonRolesString() if @gameType is AVALON_GAMETYPE
         message += " with " + @getHunterRolesString() if @gameType is HUNTER_GAMETYPE
+        message += " with " + 'Excalibur' if @gameType isnt AVALON_GAMETYPE and @gameType isnt HUNTER_GAMETYPE and @options.useExcalibur
         
         if @questions.every((i)->i.player isnt gameController)
             @startQuestionId = @askOne gameController,
@@ -231,6 +320,8 @@ class Game extends Room
                         else
                             @setAvalonOption(response.choice) if @gameType is AVALON_GAMETYPE
                             @setHunterOption(response.choice) if @gameType is HUNTER_GAMETYPE
+                            @setOriginalOption(response.choice) if @gameType is ORIGINAL_GAMETYPE
+                            @setBasicOption(response.choice) if @gameType is BASIC_GAMETYPE
                             @askToStartGame()
         else if @gameType is HUNTER_GAMETYPE
           @updateAskOne @startQuestionId, gameController,
@@ -256,12 +347,17 @@ class Game extends Room
         @cancelQuestions @everyoneExcept(@activePlayers, @players)
         
         @lobby.onGameUpdate(this)
+
+        if @settings.anonMode
+            playersInTheGame = "#{@playerNameList(@activePlayers)} are in this game."
+            @gameLog playersInTheGame
+
         @activePlayers.shuffle()
         state = @getInitialState()
 
         for own key, value of state
             this[key] = value
-        
+
         @gameStarted = true
         @onPlayersChanged()
         @missionTeamSizes = [
@@ -282,15 +378,17 @@ class Game extends Room
         if @gameType is AVALON_GAMETYPE
             whoIsInTheGame = "#{@getAvalonRolesString()} are in this game."
             @gameLog whoIsInTheGame
-        if @gameType is HUNTER_GAMETYPE
+        else if @gameType is HUNTER_GAMETYPE
             whoIsInTheGame = "#{@getHunterRolesString()} are in this game."
             @gameLog whoIsInTheGame
+        else if @options.useExcalibur
+            @gameLog "Excalibur is in this game."
           
         for p in @activePlayers
             roleMsg = ""
             if @gameType is AVALON_GAMETYPE
               roleMsg = 
-                if p.id in [@merlin, @percival, @morgana, @oberon, @mordred]
+                if p.id in [@merlin, @percival, @morgana, @oberon, @mordred, @quickdraw, @goodLancelot, @evilLancelot]
                     "You are #{p.role}. "
                 else if p.id is @assassin
                     "You are the assassin. "
@@ -331,7 +429,7 @@ class Game extends Room
             @ineligibleResHunterAccusees.push(@findPlayer(@resistanceHunter))
             @ineligibleSpyHunterAccusees.push(@findPlayer(@spyHunter))
             
-        @db.createGame JSON.stringify(state), gameType, @activePlayers, @spies,
+        @db.createGame JSON.stringify(state), gameType, @isRanked, @activePlayers, @spies,
             (err, result) => 
                 @dbId = result
                 @nextRound()
@@ -344,8 +442,11 @@ class Game extends Room
         @sendAll 'leader', { player:@activePlayers[@leader].id }
         @setGuns []
         @setInvestigator null
-        @gameLog "#{@activePlayers[@leader]} is the mission leader."
-        
+        @setExcalibur null
+        @gameLog "#{@nameOf(@activePlayers[@leader])} is the mission leader."
+
+        @checkSwitchAllegiance() if @avalonOptions.useLancelot and @mission >= 3 and @round is 1
+    
         return @askToPlayStrongLeader() if @round isnt 1 or @mission < 3
         
         @ask "deciding who to give #{@ladyInquisitorText} to.",
@@ -356,8 +457,8 @@ class Game extends Room
                 players: @getIds @everyoneExcept @ineligibleLadyOfTheLakeRecipients
                 (response, doneCb) =>
                     target = response.choice[0]
-                    response.player.sendMsg "#{target} is #{if target in @spies then 'a SPY' else 'RESISTANCE'}!"
-                    @sendAllMsgAndGameLog "#{response.player} gave #{@ladyInquisitorText} to #{target}.", [response.player]
+                    response.player.sendMsg "#{@nameOf(target)} is #{if target in @spies then 'a SPY' else 'RESISTANCE'}!"
+                    @sendAllMsgAndGameLog "#{@nameOf(response.player)} gave #{@ladyInquisitorText} to #{@nameOf(target)}.", [response.player]
                     @subCard response.player, @ladyInquisitorCard
                     @addCard target, @ladyInquisitorCard
                     @ineligibleLadyOfTheLakeRecipients.push(target)
@@ -374,7 +475,7 @@ class Game extends Room
                     return doneCb() if response.choice is 'No'
                     strongLeader = response.player
                     @leader = @activePlayers.indexOf(strongLeader)
-                    @sendAllMsgAndGameLog "#{strongLeader} used STRONG LEADER."
+                    @sendAllMsgAndGameLog "#{@nameOf(strongLeader)} used STRONG LEADER."
                     @subCard strongLeader, 'StrongLeader'
                     @sendAll 'leader', { player:strongLeader.id }
                     @cancelQuestions()
@@ -388,6 +489,8 @@ class Game extends Room
         @votelog.reject.push []
         @votelog.onteam.push []
         @votelog.investigator.push null
+        @votelog.excalibur.push null
+        @votelog.excalibured.push null
         
         return @askLeaderForTeam() if @round isnt 1 or @gameType isnt ORIGINAL_GAMETYPE
         cardsRequired = Math.floor((@activePlayers.length - 3) / 2)
@@ -414,10 +517,10 @@ class Game extends Room
         
     distributeCard: (player, card, recipient, doneCb) ->
         if card isnt 'EstablishConfidence'
-            @sendAllMsgAndGameLog "#{player} gave #{@cardName[card]} to #{recipient}.", [player]
+            @sendAllMsgAndGameLog "#{@nameOf(player)} gave #{@cardName[card]} to #{@nameOf(recipient)}.", [player]
     
         showIdentityTo = (src, dest) =>
-            dest.sendMsg "#{src} is #{if src in @spies then 'a SPY' else 'RESISTANCE'}!"
+            dest.sendMsg "#{@nameOf(src)} is #{if src in @spies then 'a SPY' else 'RESISTANCE'}!"
             doneCb()
             
         askChooseTakeCard = =>
@@ -437,7 +540,7 @@ class Game extends Room
                         recipient.sendMsg 'That is not a valid card. Try again.'
                         askChooseTakeCard()
                     else
-                        @sendAllMsgAndGameLog "#{recipient} used TAKE RESPONSIBILITY to take #{@cardName[response.choice.card]} from #{response.choice.player}.", [recipient]
+                        @sendAllMsgAndGameLog "#{@nameOf(recipient)} used TAKE RESPONSIBILITY to take #{@cardName[response.choice.card]} from #{@nameOf(response.choice.player)}.", [recipient]
                         @subCard response.choice.player, response.choice.card 
                         @addCard recipient, response.choice.card
                         doneCb()
@@ -450,7 +553,7 @@ class Game extends Room
                     n: 1
                     players: @getIds @neighboringPlayers recipient
                     (response) =>
-                        @sendAllMsgAndGameLog "#{recipient} used OVERHEARD CONVERSATION to learn the identity of #{response.choice[0]}.", [recipient]
+                        @sendAllMsgAndGameLog "#{@nameOf(recipient)} used OVERHEARD CONVERSATION to learn the identity of #{@nameOf(response.choice[0])}.", [recipient]
                         showIdentityTo response.choice[0], recipient
             when 'OpenUp'
                 @askOne recipient,
@@ -459,10 +562,10 @@ class Game extends Room
                     n: 1, 
                     players: @getIds @everyoneExcept [recipient]
                     (response) => 
-                        @sendAllMsgAndGameLog "#{recipient} used OPEN UP to show their identity to #{response.choice[0]}."
+                        @sendAllMsgAndGameLog "#{@nameOf(recipient)} used OPEN UP to show their identity to #{@nameOf(response.choice[0])}."
                         showIdentityTo recipient, response.choice[0]
             when 'EstablishConfidence'
-                @sendAllMsgAndGameLog "#{player} used ESTABLISH CONFIDENCE to show their identity to #{recipient}."
+                @sendAllMsgAndGameLog "#{@nameOf(player)} used ESTABLISH CONFIDENCE to show their identity to #{@nameOf(recipient)}."
                 showIdentityTo player, recipient
             when 'TakeResponsibility'
                 askChooseTakeCard()
@@ -479,20 +582,22 @@ class Game extends Room
                 n: @missionTeamSizes[@mission - 1]
                 (response, doneCb) =>
                     context = 
-                        msg: "#{response.player} chose mission team: #{@playerNameList(response.choice)}."
+                        msg: "#{@nameOf(response.player)} chose mission team: #{@playerNameList(response.choice)}."
                         team: response.choice
                         investigator: null
+                        excalibur: null
                         votes: []
                     @votelog.onteam.pop()
                     @votelog.onteam.push (p.id for p in response.choice)
                     @setGuns response.choice.map (i) -> i.id
                     @askLeaderForInvestigator context, (context) =>
                         @gameLog context.msg
-                        @sendAll '-vote'
-                        opinionMakers = @whoeverHas('OpinionMaker')
-                        @askForTeamApproval opinionMakers, context, (context) =>
-                            @askForTeamApproval @everyoneExcept(opinionMakers), context, (context) =>
-                                @checkTeamApproval(context)
+                        @askLeaderForExcalibur context, (context) =>
+                            @sendAll '-vote'
+                            opinionMakers = @whoeverHas('OpinionMaker')
+                            @askForTeamApproval opinionMakers, context, (context) =>
+                                @askForTeamApproval @everyoneExcept(opinionMakers), context, (context) =>
+                                    @checkTeamApproval(context)
                     doneCb()
 
     askLeaderForInvestigator: (context, cb) ->
@@ -505,13 +610,29 @@ class Game extends Room
                 n: 1
                 players: @getIds @everyoneExcept [context.team..., @activePlayers[@leader]]
                 (response) =>
-                    context.msg += " Investigator: #{response.choice[0].name}."
+                    context.msg += " Investigator: #{@nameOf(response.choice[0])}."
                     context.investigator = response.choice[0]
                     @votelog.investigator.pop()
                     @votelog.investigator.push(response.choice[0].id)
                     @setInvestigator response.choice[0].id
                     cb(context)
-                    
+
+    askLeaderForExcalibur: (context, cb) ->
+        return cb(context) if not @options.useExcalibur
+        @activePlayers[@leader].send '-vote'
+        @ask 'deciding who to give EXCALIBUR to ...',
+            @makeQuestions [@activePlayers[@leader]],
+                cmd: 'choosePlayers'
+                msg: "Choose a player to give EXCALIBUR to."
+                n: 1
+                players: @getIds @everyoneExcept [@activePlayers[@leader]], context.team
+                (response) =>
+                    context.msg += " Excalibur: #{@nameOf(response.choice[0])}."
+                    context.excalibur = response.choice[0]
+                    @votelog.excalibur.pop()
+                    @votelog.excalibur.push(response.choice[0].id)
+                    @setExcalibur response.choice[0].id
+                    cb(context)
                     
     askForTeamApproval: (players, context, cb) ->
         responses = []
@@ -559,7 +680,7 @@ class Game extends Room
                 choices: ['Yes', 'No']
                 (response, doneCb) =>                    
                     return doneCb() if response.choice is 'No'
-                    @sendAllMsgAndGameLog "#{response.player} used NO CONFIDENCE."
+                    @sendAllMsgAndGameLog "#{@nameOf(response.player)} used NO CONFIDENCE."
                     @subCard response.player, 'NoConfidence'
                     @cancelQuestions()
                     @round++
@@ -580,7 +701,7 @@ class Game extends Room
                         n: 1
                         players: @getIds context.team
                         (response) =>
-                            @sendAllMsgAndGameLog "#{response.player} used IN THE SPOTLIGHT on #{response.choice[0]}"
+                            @sendAllMsgAndGameLog "#{@nameOf(response.player)} used IN THE SPOTLIGHT on #{@nameOf(response.choice[0])}"
                             @subCard response.player, 'InTheSpotlight'
                             context.spotlight = response.choice[0]
                             doneCb()
@@ -622,9 +743,46 @@ class Game extends Room
             questions,
             =>
                 for response in context.votes when context.spotlight is response.player
-                    @sendAllMsgAndGameLog "#{context.spotlight} voted for #{if response.choice is 'Succeed' then 'SUCCESS' else 'FAILURE'}."
-                @askKeepingCloseEyes(context)
+                    @sendAllMsgAndGameLog "#{@nameOf(context.spotlight)} voted for #{if response.choice is 'Succeed' then 'SUCCESS' else 'FAILURE'}."
+                @askExcalibur(context)
+                # @askKeepingCloseEyes(context)
                 
+    askExcalibur: (context) ->
+        pickPlayer = (player, doneCb) =>
+            @askOne player,
+                cmd: 'choosePlayers'
+                msg: 'Choose who you want to use EXCALIBUR on.'
+                n: 1
+                players: @getIds @everyoneExcept [player], context.team
+                canCancel: true
+                (response) =>
+                    if response.choice.length is 0
+                        @sendAllMsgAndGameLog "#{@nameOf(@findPlayer(@excalibur))} did not use EXCALIBUR."
+                        return doneCb()
+                    return doneCb() if response.choice.length is 0
+                    choice = response.choice[0]
+                    for vote in context.votes when vote.player is choice
+                        player.sendMsg "#{@nameOf(choice)} voted for #{if vote.choice is 'Succeed' then 'SUCCESS' else 'FAILURE'}."
+                        if vote.choice is 'Succeed' then vote.choice = 'Fail' else vote.choice = 'Succeed'
+                    @sendAllMsgAndGameLog "#{@nameOf(response.player)} used EXCALIBUR on #{@nameOf(choice)}."
+                    @sendAll 'excalibured', { player: choice.id }
+                    @votelog.excalibured.pop()
+                    @votelog.excalibured.push(choice.id)
+                    doneCb()
+
+        @ask 'deciding whether to use EXCALIBUR ...',
+            @makeQuestions (if @excalibur then [@findPlayer @excalibur] else []),
+                cmd: 'choose'
+                msg: 'Do you want to use EXCALIBUR?'
+                choices: ['Yes', 'No']
+                (response, doneCb) =>
+                    if response.choice is 'No'
+                        @sendAllMsgAndGameLog "#{@nameOf(@findPlayer(@excalibur))} did not use EXCALIBUR."
+                        return doneCb()
+                    return doneCb() if response.choice is 'No'
+                    pickPlayer(response.player, doneCb)
+            => @askKeepingCloseEyes(context)
+
     askKeepingCloseEyes: (context) ->
         validPlayers = context.team[..]
         pickPlayer = null
@@ -639,16 +797,16 @@ class Game extends Room
                 (response) =>
                     return doneCb() if response.choice.length is 0
                     if response.choice[0] not in validPlayers
-                        player.sendMsg "Someone has already played KEEPING A CLOSE EYE ON YOU on #{response.choice[0]}."
+                        player.sendMsg "Someone has already played KEEPING A CLOSE EYE ON YOU on #{@nameOf(response.choice[0])}."
                         return pickPlayer(player, doneCb)
                     choice = response.choice[0]
                     validPlayers.remove choice
-                    @sendAllMsgAndGameLog "#{response.player} played KEEPING A CLOSE EYE ON YOU on #{choice}."
+                    @sendAllMsgAndGameLog "#{@nameOf(response.player)} played KEEPING A CLOSE EYE ON YOU on #{@nameOf(choice)}."
                     @subCard response.player, 'KeepingCloseEye'
                     for vote in context.votes when vote.player is choice
                         @askOne player,
                             cmd: 'choose'
-                            msg: "#{choice} voted for #{if vote.choice is 'Succeed' then 'SUCCESS' else 'FAILURE'}."
+                            msg: "#{@nameOf(choice)} voted for #{if vote.choice is 'Succeed' then 'SUCCESS' else 'FAILURE'}."
                             choices: ['OK']
                             (response) => doneCb()
                                 
@@ -704,24 +862,29 @@ class Game extends Room
             return @askToAssassinateMerlin() if @gameType isnt HUNTER_GAMETYPE
             return @askResHunterToAcuse(context)
         return @askInvestigator(context) if context.investigator?
+        return @askToQuickdraw() if @gameType is AVALON_GAMETYPE and @avalonOptions.useQuickdraw
         @nextMission()
 
     askToAssassinateMerlin: ->
-        return @resistanceWins() if @gameType isnt AVALON_GAMETYPE
+        return @resistanceWins() if @gameType isnt AVALON_GAMETYPE or @quickdrawHasShot
         assassin = @findPlayer(@assassin)
         @ask 'choosing a player to assassinate ...',
             @makeQuestions [assassin],
                 cmd: 'choosePlayers'
                 msg: 'Choose a player to assassinate.'
                 n: 1
-                players: @getIds @activePlayers.filter((player) => player.id is @oberon or player not in @spies)
+                players: @getIds @activePlayers.filter((player) =>
+                    if @avalonOptions.useNorebo or @avalonOptions.usePalm
+                        return player.id isnt @assassin and player.id isnt @evilLancelot
+                    return (player not in @spies or player.id is @oberon or player.id is @goodLancelot) and player.id isnt @evilLancelot
+                )
                 (response, doneCb) =>
-                    @sendAllMsgAndGameLog "#{assassin} chose to assassinate #{response.choice[0]}."
+                    @sendAllMsgAndGameLog "#{@nameOf(assassin)} chose to assassinate #{@nameOf(response.choice[0])}."
                     if response.choice[0].id is @merlin
-                        @sendAllMsgAndGameLog "#{assassin} guessed RIGHT. #{response.choice[0]} was Merlin!"
+                        @sendAllMsgAndGameLog "#{@nameOf(assassin)} guessed RIGHT. #{@nameOf(response.choice[0])} was Merlin!"
                         @spiesWin()
                     else
-                        @sendAllMsgAndGameLog "#{assassin} guessed WRONG. #{@findPlayer(@merlin)} was Merlin, not #{response.choice[0]}!"
+                        @sendAllMsgAndGameLog "#{@nameOf(assassin)} guessed WRONG. #{@nameOf(@findPlayer(@merlin))} was Merlin, not #{@nameOf(response.choice[0])}!"
                         @resistanceWins()
                     doneCb()
     
@@ -754,7 +917,7 @@ class Game extends Room
             @spyHunterRevealed = true
             @sendAll '-vote'
             @sendPlayers(p) for p in @players
-            @sendAll "#{spyHunter} is the Spy Hunter"
+            @sendAll "#{@nameOf(spyHunter)} is the Spy Hunter"
             @ineligibleResHunterAccusees.push(spyHunter)
             
         target = 'Resistance Chief'
@@ -767,15 +930,15 @@ class Game extends Room
                 n: 1
                 players: @getIds @everyoneExcept @ineligibleSpyHunterAccusees
                 (response) =>   
-                    @sendAllMsgAndGameLog "#{spyHunter} chose to accuse #{response.choice[0]}."
+                    @sendAllMsgAndGameLog "#{@nameOf(spyHunter)} chose to accuse #{@nameOf(response.choice[0])}."
                     if response.choice[0].id in @resistanceChiefs
-                        @sendAllMsgAndGameLog "#{spyHunter} guessed RIGHT. #{response.choice[0]} was #{if @resistanceChiefs.length < 2 then 'the' else 'a'} Resistance Chief!"
+                        @sendAllMsgAndGameLog "#{@nameOf(spyHunter)} guessed RIGHT. #{@nameOf(response.choice[0])} was #{if @resistanceChiefs.length < 2 then 'the' else 'a'} Resistance Chief!"
                         @spiesWin()
                     else if response.choice[0].id is @coordinator
-                        @sendAllMsgAndGameLog "#{spyHunter} guessed RIGHT. #{response.choice[0]} was the Coordinator!"
+                        @sendAllMsgAndGameLog "#{@nameOf(spyHunter)} guessed RIGHT. #{@nameOf(response.choice[0])} was the Coordinator!"
                         @spiesWin()
                     else
-                        @sendAllMsgAndGameLog "#{spyHunter} guessed WRONG. #{response.choice[0]} is not a #{target}!"
+                        @sendAllMsgAndGameLog "#{@nameOf(spyHunter)} guessed WRONG. #{@nameOf(response.choice[0])} is not a #{target}!"
                         @score.pop()
                         @score.push(true)
                         @sendAll 'scoreboard', @getScoreboard()
@@ -789,7 +952,7 @@ class Game extends Room
             @resHunterRevealed = true
             @sendAll '-vote'
             @sendPlayers(p) for p in @players
-            @sendAll "#{resHunter} is the Resistance Hunter"
+            @sendAll "#{@nameOf(resHunter)} is the Resistance Hunter"
             @ineligibleSpyHunterAccusees.push(resHunter)
             
         @ask 'choosing a player to accuse as the Spy Chief ...',
@@ -799,12 +962,12 @@ class Game extends Room
                 n: 1
                 players: @getIds @everyoneExcept @ineligibleResHunterAccusees
                 (response) =>   
-                    @sendAllMsgAndGameLog "#{resHunter} chose to accuse #{response.choice[0]}."
+                    @sendAllMsgAndGameLog "#{@nameOf(resHunter)} chose to accuse #{@nameOf(response.choice[0])}."
                     if response.choice[0].id in @spyChiefs
-                        @sendAllMsgAndGameLog "#{resHunter} guessed RIGHT. #{response.choice[0]} was #{if @resistanceChiefs.length < 2 then 'the' else 'a'} Spy Chief!"
+                        @sendAllMsgAndGameLog "#{@nameOf(resHunter)} guessed RIGHT. #{@nameOf(response.choice[0])} was #{if @resistanceChiefs.length < 2 then 'the' else 'a'} Spy Chief!"
                         @resistanceWins()
                     else
-                        @sendAllMsgAndGameLog "#{resHunter} guessed WRONG. #{response.choice[0]} is not a Spy Chief!"
+                        @sendAllMsgAndGameLog "#{@nameOf(resHunter)} guessed WRONG. #{@nameOf(response.choice[0])} is not a Spy Chief!"
                         @score.pop()
                         @score.push(false)
                         @sendAll 'scoreboard', @getScoreboard()
@@ -825,7 +988,7 @@ class Game extends Room
               n: 1
               players: @getIds @everyoneExcept([investigator], context.team)
               (response) =>
-                  @sendAllMsgAndGameLog "#{investigator} chooses to investigate #{response.choice}."
+                  @sendAllMsgAndGameLog "#{@nameOf(investigator)} chooses to investigate #{@nameOf(response.choice[0])}."
                   @askToInvestigate(investigator, response.choice[0])
             
     askToInvestigate: (investigator, target) ->
@@ -847,8 +1010,36 @@ class Game extends Room
                 msg: 'Choose a response to investigation.'
                 choices: options
                 (response) =>
-                    investigator.sendMsg "#{target} responds '#{response.choice}'"
+                    investigator.sendMsg "#{@nameOf(target)} responds '#{response.choice}''"
                     @nextMission()
+
+    askToQuickdraw: ->
+        # return @resistanceWins() if @gameType isnt AVALON_GAMETYPE
+        quickdraw = @findPlayer(@quickdraw)
+        @ask 'choosing a player to assassinate ...',
+            @makeQuestions [quickdraw],
+                cmd: 'choosePlayers'
+                msg: 'Choose a player to assassinate.'
+                n: if @quickdrawHasShot then 0 else 1
+                canCancel: true
+                players: @getIds @activePlayers.filter((player) =>
+                    if @avalonOptions.useNorebo or @avalonOptions.usePalm
+                        return player.id isnt @assassin and player.id isnt @evilLancelot
+                    return player not in @spies or player.id is @oberon or player.id is @goodLancelot and player.id isnt @evilLancelot
+                )
+                (response, doneCb) =>
+                    if response.choice.length is 1 and not @quickdrawHasShot
+                        if response.choice[0].id is @merlin
+                            @sendAllMsgAndGameLog "#{@nameOf(quickdraw)} guessed RIGHT. #{@nameOf(response.choice[0])} was Merlin!"
+                            @spiesWin()
+                        else
+                            for p in @spies
+                                p.sendMsg "Quickdraw guessed WRONG. #{@nameOf(response.choice[0])} is NOT MERLIN!" if not @oberon? or p.id isnt @oberon
+                        @quickdrawHasShot = true
+                    @nextMission() if not @gameFinished
+                    doneCb()
+            (->),
+            true
 
     nextMission: ->
         @round = 1
@@ -869,7 +1060,81 @@ class Game extends Room
         @setStatus (if spiesWin then 'The spies win!' else 'The resistance wins!')
         @lobby.onGameUpdate(this)
         @lobby.sendAllChat null, "Game ##{@id} finished: the #{if spiesWin then 'spies' else 'resistance'} won!"
-        @db.finishGame @dbId, spiesWin, ->
+        @db.finishGame @dbId, spiesWin, =>
+            updateTokens = () =>
+                g.tokens.update @activePlayers, (err, users) =>
+                    return console.log err if err?
+                    cmd = { player:"server", msg:"You get a token!!", serverMsg:true, isSpectator:false }
+                    for user in users
+                        if user.newToken
+                            player = g.playersById[user.id]
+                            player.send 'chat', cmd
+                            player.roleTokens = player.roleTokens + 1
+                    for id, role of @roleChoices
+                        playerId = parseInt(id)
+                        player = @findPlayer playerId
+                        @db.setRoleTokens playerId, player.roleTokens-1, (err, result) =>
+                            return if err?
+                            player = g.playersById[id]
+                            return if not player
+                            player.roleTokens = player.roleTokens - 1
+                            @sendChooseRole player
+            if @isRanked
+                sendRatings = (users, ratingsType) =>
+                    for user in users
+                        if not user.stats_hidden
+                            player = @findPlayer user.id
+                            msg = "<b>#{ratingsType}:</b> "
+                            l = user.changes.length
+                            sign = if user.changes[0].change >= 0 then "+" else ""
+                            for i in [0..l-2]
+                                msg += "#{user.changes[i].name}: #{user.changes[i].before} → <strong>#{user.changes[i].after}</strong> (#{sign}#{user.changes[i].change}), "
+                            msg += "#{user.changes[l-1].name}: #{user.changes[l-1].before} → <strong>#{user.changes[l-1].after}</strong> (#{sign}#{user.changes[l-1].change})"
+                            cmd = { player:"server", msg:msg, serverMsg:true, isSpectator:false }
+                            player.send 'chat', cmd
+                res = @activePlayers.filter((player) => player not in @spies)
+                g.rating.update @spies, res, spiesWin, @gameType, 1, (err, users) =>
+                    return console.log "Rating error" if err?
+                    sendRatings(users, 'All-time')
+                    g.rating.update @spies, res, spiesWin, @gameType, 2, (err, users) =>
+                        return console.log "Rating error" if err?
+                        sendRatings(users, 'Biweekly')
+                        g.stats.refresh()
+                        updateTokens()
+            else
+                @db.updateUnrankedGames @activePlayers, (err, result) =>
+                    return console.log err if err?
+                    updateTokens()
+
+    checkSwitchAllegiance: ->
+        goodLancelot = @findPlayer @goodLancelot
+        evilLancelot = @findPlayer @evilLancelot
+        if @loyaltyDeck[@mission - 3] is 'Switch Allegiance'
+            # Show revealed loyalty card
+            @sendAllMsgAndGameLog 'The “Switch Allegiance” card is drawn from the Loyalty deck. The two Lancelot players secretly switch their allegiances.'
+            # remove one player from spies and add the other
+            if goodLancelot in @spies
+                @spies.remove(goodLancelot)
+                goodLancelot.sendMsg 'You are now RESISTANCE!'
+                @db.updateGameplayer @dbId, @goodLancelot, false, (err, result) ->
+            else
+                @spies.push(goodLancelot)
+                goodLancelot.sendMsg 'You are now a SPY!'
+                @db.updateGameplayer @dbId, @goodLancelot, true, (err, result) ->
+            if evilLancelot in @spies
+                @spies.remove(evilLancelot)
+                evilLancelot.sendMsg 'You are now RESISTANCE!'
+                @db.updateGameplayer @dbId, @evilLancelot, false, (err, result) ->
+            else
+                @spies.push(evilLancelot)
+                evilLancelot.sendMsg 'You are now a SPY!'
+                @db.updateGameplayer @dbId, @evilLancelot, true, (err, result) ->
+            @sendPlayers(p) for p in @players
+        else
+            # Show revealed loyalty card
+            @sendAllMsgAndGameLog 'The “No Change” card is drawn from the Loyalty deck. The two Lancelot players do not switch their allegiances.'
+            # Optionally report to players that their alignment didn't switch
+
 
 #-----------------------------------------------------------------------------    
 # Helper functions
@@ -885,7 +1150,7 @@ class Game extends Room
             return @cards.splice(idx, 1)
             
     playerNameList: (players) ->
-        @nameList (player.name for player in players)
+        @nameList (@nameOf(player) for player in players)
     
     nameList: (names) ->
         ans = ''
@@ -928,6 +1193,11 @@ class Game extends Room
         
     getIds: (players) ->
         player.id for player in players
+
+    getPlayerIndex: (playerId) ->
+        for p, index in @activePlayers
+            return index if (p.id is playerId)
+        throw "Invalid player"
     
     whoeverHas: (cardName) ->
         players = (card.player for card in @cards when card.card is cardName)
@@ -937,6 +1207,12 @@ class Game extends Room
         @lobby.onGameUpdate(this)
         @sendPlayers(p) for p in @players
         @askToStartGame()
+        activeIds = @getIds(@activePlayers)
+        for id, role of @roleChoices
+            playerId = parseInt(id)
+            if not (playerId in activeIds) and not @gameStarted
+                delete @roleChoices[id]
+                @sendAll 'chooseRole', { used: false }
             
     sendPlayers: (me) ->
         isSpy = (player) => 
@@ -953,13 +1229,22 @@ class Game extends Room
                 else
                   iKnowTheyAreASpy =
                     me.id is them.id or
-                    (isSpy(me) and me.id isnt @oberon and them.id isnt @oberon) or
-                    (me.id is @merlin and them.id isnt @mordred)
+                    (isSpy(me) and not (me.id in [@oberon, @goodLancelot, @evilLancelot]) and them.id isnt @oberon and them.id isnt @goodLancelot) or
+                    (me.id is @merlin and them.id isnt @mordred and them.id isnt @goodLancelot)
                    
                 {
-                    isSpy: isSpy(them) and (@gameFinished or iKnowTheyAreASpy)
+                    isSpy:
+                        (isSpy(me) and them.id in [@norebo, @palm] and not @gameFinished and me.id isnt @oberon) or
+                        (me.id is @merlin and (them.id is @palm or them.id is @evilLancelot) and not (them.id is me.id) and not @gameFinished) or
+                        (isSpy(them) and (@gameFinished or iKnowTheyAreASpy))
                     id: them.id
-                    name: them.name
+                    name: 
+                        if @gameFinished and @settings.anonMode
+                            @nameMap[them.id] + ' - ' + them.name
+                        else
+                            @nameOf(them)
+                    resImg: if them.avatarEnabled and (not @settings.anonMode or (@gameFinished or not @gameStarted)) then them.resImg else @defaultResImg
+                    spyImg: if them.avatarEnabled and (not @settings.anonMode or (@gameFinished or not @gameStarted)) then them.spyImg else @defaultSpyImg
                     role:
                         if @gameFinished or (me.id is them.id) or
                           (@resHunterRevealed and them.id is @resistanceHunter) or
@@ -967,6 +1252,8 @@ class Game extends Room
                             them.role
                         else if me.id is @percival and (them.id is @merlin or them.id is @morgana)
                             if @morgana? then "Merlin?" else "Merlin"
+                        else if isSpy(me) and not (me.id in [@oberon, @goodLancelot]) and them.id is @evilLancelot
+                            them.role
                         else if @resistanceChiefs? and me.id in @resistanceChiefs and
                           (them.id in @resistanceChiefs or them.id is @coordinator)
                             them.role
@@ -979,9 +1266,21 @@ class Game extends Room
                                 undefined
                         else
                             undefined
+                    role2: if @gameFinished then them.role2 else undefined
                 }
       
         me.send 'players', { players:response, amSpy:isSpy(me) }
+
+    sendLobbyPlayers: (player) ->
+        for id, p of g.playersById
+            player.send '+player', { id: p.id, name: p.name }
+
+    sendChooseRole: (player) ->
+        canChoose = player.roleTokens > 0 and not @isRanked and not @gameStarted
+        isMe = @roleChoices[player.id]
+        used = Object.keys(@roleChoices).length > 0
+        desc = if isMe then "You have chosen #{@roleChoices[player.id]}." else "A role has been chosen."
+        player.send 'chooseRole', { canChoose: canChoose, isMe: isMe, used: used, desc: desc, numTokens: player.roleTokens}
                 
     askOne: (player, cmd, cb) ->
         question = JSON.parse(JSON.stringify(cmd))
@@ -995,14 +1294,15 @@ class Game extends Room
         question.choiceId = questionId
         player.send question.cmd, question
 
-    ask: (status, questions, cb = ->) ->
+    ask: (status, questions, cb = (->), isAnonymous = false) ->
         return cb() if questions.length is 0
         players = questions.map (q) -> q.player
 
         showStatus = =>
             uniquePlayers = (p for p in @activePlayers when p in players)
             isAre = (if uniquePlayers.length is 1 then 'is' else 'are')
-            @setStatus "#{@nameList(uniquePlayers)} #{isAre} #{status}"
+            nameList = if isAnonymous then @nameList (p.role for p in @activePlayers when p in players) else @playerNameList(uniquePlayers)
+            @setStatus "#{nameList} #{isAre} #{status}"
 
         showStatus()
         for q in questions
@@ -1029,7 +1329,11 @@ class Game extends Room
         for p in @activePlayers when p.id is playerId
             return p
         throw "Invalid player"
-        
+
+    nameOf: (player) ->
+        return @nameMap[player.id] if @settings.anonMode and @gameStarted and not @gameFinished and @nameMap[player.id]
+        return player.name
+
     answerQuestion: (question, choice) ->
         question.choice = choice
         @questions.remove question
@@ -1049,8 +1353,9 @@ class Game extends Room
         state = 
             spies: []
             leader: Math.floor(Math.random() * @activePlayers.length)
+        resistanceTeam = []
             
-        resistanceRoles = ['Resistance', 'Merlin', 'Percival']
+        resistanceRoles = ['Resistance', 'Merlin', 'Percival', 'Norebo', 'Palm', 'Good Lancelot']
         resistanceRoles = ['Resistance', 'Resistance Chief', 'Resistance Hunter',
           'Dummy Agent','Coordinator','Pretender'] if @gameType is HUNTER_GAMETYPE
         spiesRequired = Math.floor((@activePlayers.length - 1) / 3) + 1
@@ -1068,17 +1373,37 @@ class Game extends Room
           state.resistanceChiefs = []
           state.spyChiefs = []
           state.earlyAccusationUsed = false
-          
+
+        if @avalonOptions.useLancelot
+            state.loyaltyDeck = ['No Change', 'No Change', 'No Change', 'Switch Allegiance', 'Switch Allegiance']
+            state.loyaltyDeck.shuffle()
+
+        # Role Choices
+        for id, role of @roleChoices
+            if role in roles
+                index = @getPlayerIndex parseInt(id)
+                @activePlayers[index].role = role
+                roles.remove(role)
+                roles.splice(index, 0, role)
+            else
+                delete @roleChoices[id]
+
+        # Assign roles
         for role, i in roles
-            @activePlayers[i].role = role
+            if not @activePlayers[i].role
+                @activePlayers[i].role = role
             state.spies.push(@activePlayers[i]) if role not in resistanceRoles
+            resistanceTeam.push(@activePlayers[i]) if role in resistanceRoles
             if @gameType is AVALON_GAMETYPE
               state.merlin = @activePlayers[i].id if role is 'Merlin'
-              state.assassin = @activePlayers[i].id if role in ['Assassin', 'Mordred/Assassin']
+              state.assassin = @activePlayers[i].id if role in ['Assassin', 'Mordred/Assassin', 'Quickdraw', 'Mordred/Quickdraw']
               state.percival = @activePlayers[i].id if role is 'Percival'
               state.morgana = @activePlayers[i].id if role is 'Morgana'
               state.oberon = @activePlayers[i].id if role is 'Oberon'
-              state.mordred = @activePlayers[i].id if role in ['Mordred', 'Mordred/Assassin']
+              state.mordred = @activePlayers[i].id if role in ['Mordred', 'Mordred/Assassin', 'Mordred/Quickdraw']
+              state.quickdraw = @activePlayers[i].id if role in ['Quickdraw', 'Mordred/Quickdraw']
+              state.goodLancelot = @activePlayers[i].id if role is 'Good Lancelot'
+              state.evilLancelot = @activePlayers[i].id if role is 'Evil Lancelot'
             if @gameType is HUNTER_GAMETYPE
               state.resistanceChiefs.push(@activePlayers[i].id) if role is 'Resistance Chief'
               state.resistanceHunter = @activePlayers[i].id if role is 'Resistance Hunter'
@@ -1094,6 +1419,16 @@ class Game extends Room
 
         if @hunterOptions.useInquisitor
             state.inquisitor = @activePlayers[state.leader].id
+
+        if @options.useExcalibur
+            state.useExcalibur = true
+
+        if @gameType is AVALON_GAMETYPE
+            resistanceTeam.shuffle()
+            for role, i in @getAvalonRoles2()
+                resistanceTeam[i].role2 = role
+                state.norebo = resistanceTeam[i].id if role is 'Norebo'
+                state.palm = resistanceTeam[i].id if role is 'Palm'
 
         if @gameType is ORIGINAL_GAMETYPE
             deck = [
@@ -1120,6 +1455,16 @@ class Game extends Room
                 
             deck.shuffle()
             state.deck = deck
+
+        if @settings.anonMode
+            names = g.anonNames[0].names
+            for category in g.anonNames when category.category is @settings.anonCategory
+                names = category.names
+            names.shuffle()
+            for player, i in @activePlayers
+                @nameMap[player.id] = names[i]
+                player.sendMsg "You are now #{names[i]}."
+            state.nameMap = @nameMap
         
         return state
         
@@ -1139,6 +1484,10 @@ class Game extends Room
     setInvestigator: (investigator) ->
         @investigator = investigator
         @sendAll 'investigator', { player: investigator }
+
+    setExcalibur: (excalibur) ->
+        @excalibur = excalibur
+        @sendAll 'excalibur', { player: excalibur }
     
     getAvalonOptions: ->
         ans = ['Options']
@@ -1159,10 +1508,19 @@ class Game extends Room
         addRemove @avalonOptions.useOberon, 'Oberon'
         addRemove @avalonOptions.useMordred, 'Mordred'
 
-        if @avalonOptions.useMordred
-            ans.push(if @avalonOptions.combineMordredAndAssassin then 'Separate Mordred and Assassin' else 'Combine Mordred and Assassin')
+        if @avalonOptions.useMordred 
+            if not @avalonOptions.useQuickdraw
+                ans.push(if @avalonOptions.combineMordredAndAssassin then 'Separate Mordred and Assassin' else 'Combine Mordred and Assassin')
+            else
+                ans.push(if @avalonOptions.combineMordredAndAssassin then 'Separate Mordred and Quickdraw' else 'Combine Mordred and Quickdraw')
+
+        addRemove @avalonOptions.useLancelot, 'Lancelot'
         
         addRemove @avalonOptions.useLadyOfTheLake, 'Lady of the Lake'
+        addRemove @options.useExcalibur, 'Excalibur'
+        addRemove @avalonOptions.useNorebo, 'Norebo'
+        addRemove @avalonOptions.usePalm, 'Palm'
+        addRemove @avalonOptions.useQuickdraw, 'Quickdraw'
         return ans
 
     setAvalonOption: (choice) ->
@@ -1178,6 +1536,16 @@ class Game extends Room
                 @avalonOptions.useMordred = true
             when 'Add Lady of the Lake'
                 @avalonOptions.useLadyOfTheLake = true
+            when 'Add Excalibur'
+                @options.useExcalibur = true
+            when 'Add Norebo'
+                @avalonOptions.useNorebo = true
+            when 'Add Palm'
+                @avalonOptions.usePalm = true
+            when 'Add Quickdraw'
+                @avalonOptions.useQuickdraw = true
+            when 'Add Lancelot'
+                @avalonOptions.useLancelot = true
             when 'Remove Percival', 'Remove Percival and Morgana'
                 @avalonOptions.usePercival = false
                 @avalonOptions.useMorgana = false
@@ -1189,9 +1557,23 @@ class Game extends Room
                 @avalonOptions.useMordred = false
             when 'Remove Lady of the Lake'
                 @avalonOptions.useLadyOfTheLake = false
+            when 'Remove Excalibur'
+                @options.useExcalibur = false
+            when 'Remove Norebo'
+                @avalonOptions.useNorebo = false
+            when 'Remove Palm'
+                @avalonOptions.usePalm = false
+            when 'Remove Quickdraw'
+                @avalonOptions.useQuickdraw = false
+            when 'Remove Lancelot'
+                @avalonOptions.useLancelot = false
             when 'Combine Mordred and Assassin'
                 @avalonOptions.combineMordredAndAssassin = true
             when 'Separate Mordred and Assassin'
+                @avalonOptions.combineMordredAndAssassin = false
+            when 'Combine Mordred and Quickdraw'
+                @avalonOptions.combineMordredAndAssassin = true
+            when 'Separate Mordred and Quickdraw'
                 @avalonOptions.combineMordredAndAssassin = false
 
     getAvalonRoles: ->
@@ -1200,24 +1582,46 @@ class Game extends Room
         roles.push('Morgana') if @avalonOptions.useMorgana
         roles.push('Oberon') if @avalonOptions.useOberon
         if not @avalonOptions.useMordred
-            roles.push('Assassin')
-        else if @avalonOptions.combineMordredAndAssassin
+            if not @avalonOptions.useQuickdraw
+                roles.push('Assassin')
+            else
+                roles.push('Quickdraw')
+        else if @avalonOptions.combineMordredAndAssassin and not @avalonOptions.useQuickdraw
             roles.push('Mordred/Assassin')
+        else if @avalonOptions.combineMordredAndAssassin and @avalonOptions.useQuickdraw
+            roles.push('Mordred/Quickdraw')
         else
             roles.push('Mordred')
-            roles.push('Assassin')
+            if not @avalonOptions.useQuickdraw
+                roles.push('Assassin')
+            else
+                roles.push('Quickdraw')
+        if @avalonOptions.useLancelot
+            roles.push('Good Lancelot')
+            roles.push('Evil Lancelot')
+        return roles
+
+    getAvalonRoles2: ->
+        roles = []
+        roles.push('Norebo') if @avalonOptions.useNorebo
+        roles.push('Palm') if @avalonOptions.usePalm
         return roles
 
     getAvalonRolesString: ->
         return '' if @gameType isnt AVALON_GAMETYPE
         roles = @getAvalonRoles()
         roles.push('Lady of the Lake') if @avalonOptions.useLadyOfTheLake
+        roles.push('Excalibur') if @options.useExcalibur
+        roles = roles.concat @getAvalonRoles2()
         return @nameList(roles)
         
     getRequiredPlayers: ->
         if @gameType is AVALON_GAMETYPE
-          badGuys = @getAvalonRoles().length - (if @avalonOptions.usePercival then 2 else 1)
-          return [5, 5, 5, 7, 10][badGuys]
+          goodGuys = @getAvalonRoles().reduce ((total, role) -> total + (role in ['Merlin', 'Percival', 'Good Lancelot'] ? 1 : 0)), 0
+          badGuys = @getAvalonRoles().length - goodGuys
+          goodMin = [5, 5, 5, 5, 6, 8][goodGuys]
+          badMin = [5, 5, 5, 7, 10][badGuys]
+          return Math.max(goodMin, badMin, goodGuys + badGuys)
         if @gameType is HUNTER_GAMETYPE
           resRoles = 0
           ++resRoles if @hunterOptions.useDummyAgent
@@ -1248,6 +1652,7 @@ class Game extends Room
             ans.push(if @hunterOptions.useDeepAgent then 'Add Pretender' else 'Add Deep Agent and Pretender')
 
         addRemove @hunterOptions.useInquisitor, 'Inquisitor'
+        addRemove @options.useExcalibur, 'Excalibur'
         return ans
 
     setHunterOption: (choice) ->
@@ -1263,6 +1668,8 @@ class Game extends Room
                 @hunterOptions.usePretender = true
             when 'Add Inquisitor'
                 @hunterOptions.useInquisitor = true
+            when 'Add Excalibur'
+                @options.useExcalibur = true
             when 'Remove Dummy Agent'
                 @hunterOptions.useDummyAgent = false
             when 'Remove Coordinator'
@@ -1274,6 +1681,8 @@ class Game extends Room
                 @hunterOptions.usePretender = false
             when 'Remove Inquisitor'
                 @hunterOptions.useInquisitor = false
+            when 'Remove Excalibur'
+                @options.useExcalibur = false
                 
     getHunterRoles: ->
         roles = []
@@ -1307,4 +1716,37 @@ class Game extends Room
         return '' if @gameType isnt HUNTER_GAMETYPE
         roles = @getHunterRoles()
         roles.push('Inquisitor') if @hunterOptions.useInquisitor
+        roles.push('Excalibur') if @options.useExcalibur
         return @nameList(roles)
+
+    getOriginalOptions: ->
+        ans = ['Options']
+        
+        addRemove = (flag, role) ->
+            ans.push((if flag then 'Remove ' else 'Add ') + role)
+            
+        addRemove @options.useExcalibur, 'Excalibur'
+        return ans
+
+    setOriginalOption: (choice) ->
+        switch choice
+            when 'Add Excalibur'
+                @options.useExcalibur = true
+            when 'Remove Excalibur'
+                @options.useExcalibur = false
+
+    getBasicOptions: ->
+        ans = ['Options']
+        
+        addRemove = (flag, role) ->
+            ans.push((if flag then 'Remove ' else 'Add ') + role)
+            
+        addRemove @options.useExcalibur, 'Excalibur'
+        return ans
+
+    setBasicOption: (choice) ->
+        switch choice
+            when 'Add Excalibur'
+                @options.useExcalibur = true
+            when 'Remove Excalibur'
+                @options.useExcalibur = false

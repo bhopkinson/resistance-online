@@ -7,8 +7,9 @@ var submit = function() {
     .done(function () {
         window.location = 'main.html';
     })
-    .fail(function () {
-        window.alert('Invalid username or password.');
+    .fail(function (xmlHttpRequest, code, error) {
+        window.alert(xmlHttpRequest.responseText);
+        //window.alert('Invalid username or password.');
     });        
 }
 

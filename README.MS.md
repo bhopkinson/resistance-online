@@ -1,67 +1,25 @@
-## Getting Started (Linux/Postgres)
+### Getting Started
 
-#### Optional: Set up [nodeenv](http://ekalinin.github.io/nodeenv/) and enter the environment
-#### Install dependencies
+##### Install dependencies
 
-* Install [Node.JS](https://nodejs.org/en/)
-* If needed due to a conflict, symlink /usr/bin/node to /usr/bin/nodejs: ``sudo ln -s `which nodejs` /usr/bin/node``
+* Install [Node.JS](http://nodejs.org/dist/v0.8.26/) v0.8.26.  **It is important to install this version, and not a newer one, because the Microsoft driver below is only compatible with v0.8.x releases of Node.JS.**
+* Install [Microsoft Driver for Node.JS](http://www.microsoft.com/en-us/download/details.aspx?id=29995).
 * From the command line, run `npm install -g coffee-script` to install CoffeeScript. 
-* Install [PostgreSQL](https://www.postgresql.org/download/)
 
-#### Create a Postgres database
+##### Create the database
 
-Any one will do. A simple pattern for doing it at home (Debian-ish) is:
+* Install [MS SQL Server Express](http://www.microsoft.com/en-us/download/details.aspx?id=29062).
+* Create a "resistancetest" database in MS SQL Server Express.
+* Run misc\recreatedb.sql on the database.
 
-```
-$ sudo su postgres
-$ psql
-postgres=# CREATE USER mypguser WITH PASSWORD 'mypguserpass';
-postgres=# CREATE DATABASE mypgdatabase OWNER mypguser;
-postgres=# \q
-$ exit
-```
+##### Build and run the server
 
-#### Set up DB tables
+* Edit sample_options.json
+* Run `build.cmd`
+* Run `node release\Server.js sample_options.json`
+* Navigate to [http://localhost/](http://localhost/)
 
-```
-$ psql -h localhost -U mypguser -d mypgdatabase
-Password for user mypguser:
-psql (9.4.2, server 9.3.4)
-SSL connection (protocol: TLSv1.2, cipher: DHE-RSA-AES256-GCM-SHA384, bits: 256, compression: off)
-Type "help" for help.
-
-mypgdatabase=> \i misc/recreatedb_pg.sql
-mypgdatabase=> \q
-```
-
-#### Set the environment variables
-This name of this .json file is an argument to the program. By default the file is sample_options.json.
-
-```
-{
-    "port": 8080,
-    "db_connection_string": "postgres://mypguser:mypguserpass@localhost/mypgdatabase"
-}
-```
-
-Or equivalent for your choice of hostname, user, password and database name above.
-
-#### Build
-
-```
-make
-```
-
-#### Run
-
-```
-node release/Server.js sample_options.json
-```
-
-And connect on [http://localhost:8080](http://localhost:8080)
-
-
-## Overview
+### Overview
 
 After logging in, the client is assigned a "session key" as a cookie.  This session key must be sent by the client in subsequent messages.
 
