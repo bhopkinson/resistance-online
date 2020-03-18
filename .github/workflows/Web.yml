@@ -1,7 +1,9 @@
-name: Publish Server Docker
+name: Publish Web Docker
 on:
   push:
-    paths: server/**
+    paths-ignore:
+      - 'database/**'
+      - 'misc/**'
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -10,8 +12,8 @@ jobs:
     - name: Publish to Registry
       uses: HurricanKai/Publish-Docker-Github-Action@master
       with:
-        name: bjh101/resistance-server
-        dockerfile: server/Dockerfile
+        name: bjh101/resistance-online
+        dockerfile: Dockerfile
         username: ${{ secrets.DOCKER_USERNAME }}
         password: ${{ secrets.DOCKER_PASSWORD }}
         snapshot: true
