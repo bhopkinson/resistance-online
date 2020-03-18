@@ -1,4 +1,4 @@
-name: Publish Database Docker
+name: Publish Server Docker
 on:
   push:
     paths: server/**
