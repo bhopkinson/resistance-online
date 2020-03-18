@@ -986,7 +986,7 @@ class Game extends Room
               cmd: 'choosePlayers'
               msg: 'Choose a player to investigate.'
               n: 1
-              players: @getIds @everyoneExcept([investigator], context.team)
+              players: @getIds @everyoneExcept([investigator])
               (response) =>
                   @sendAllMsgAndGameLog "#{@nameOf(investigator)} chooses to investigate #{@nameOf(response.choice[0])}."
                   @askToInvestigate(investigator, response.choice[0])
@@ -994,14 +994,17 @@ class Game extends Room
     askToInvestigate: (investigator, target) ->
         options =
           if target.id in @spyChiefs
-              ['Chief', 'Spy Chief']
+            if @activePlayers.length > 7
+              ['Spy Chief']
+            else
+              ['Chief']
           else if target.id in @resistanceChiefs
-              if @activePlayers.length > 6
+              if @activePlayers.length > 7
                   ['Resistance Chief']
               else
                   ['Chief']
           else if target.id is @dummyAgent
-              ['Chief', 'Not a Chief']
+              ['Resistance Chief', 'Not a Chief']
           else
               ['Not a Chief']
         @ask 'choosing a reponse to investigation ...',
