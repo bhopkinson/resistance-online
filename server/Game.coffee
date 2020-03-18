@@ -942,7 +942,7 @@ class Game extends Room
                         @score.pop()
                         @score.push(true)
                         @sendAll 'scoreboard', @getScoreboard()
-                        @sendAllMsgAndGameLog "mission failure has been reversed!"
+                        @sendAllMsgAndGameLog "mission result changed to success!"
                         @ineligibleSpyHunterAccusees.push(response.choice[0])
                         @checkScoreForWinners(context)
                             
@@ -971,7 +971,7 @@ class Game extends Room
                         @score.pop()
                         @score.push(false)
                         @sendAll 'scoreboard', @getScoreboard()
-                        @sendAllMsgAndGameLog "mission success has been reversed!"
+                        @sendAllMsgAndGameLog "mission result changed to fail!"
                         @ineligibleResHunterAccusees.push(response.choice[0])
                         @checkScoreForWinners(context)
 
