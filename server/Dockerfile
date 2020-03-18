@@ -1,6 +1,6 @@
 FROM node:13.10
 
-RUN npm install -g coffee-script
+RUN npm install -g coffeescript
 
 WORKDIR /usr/src/app
 
