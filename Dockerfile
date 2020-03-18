@@ -2,9 +2,11 @@ FROM node:13.10
 
 RUN npm install -g coffeescript
 
-RUN make
+WORKDIR /usr/src/app
 
 COPY . .
+
+RUN make
 
 EXPOSE 8080
 
