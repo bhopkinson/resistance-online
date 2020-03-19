@@ -1,6 +1,6 @@
 {
     "port": 8080,
-    "db_connection_string": "postgres://#{POSTGRES_USER}#:#{POSTGRES_PASSWORD}#@database/resistance",
+    "db_connection_string": "postgres://#{POSTGRES_USER}#:#{POSTGRES_PASSWORD}#@misc_database_1/resistance",
     "admin": [],
     "mods": []
 }
