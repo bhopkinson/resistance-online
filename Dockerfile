@@ -2,8 +2,6 @@ FROM node:9
 
 RUN npm install -g coffeescript@^1.0.0
 
-WORKDIR /usr/src/app
-
 COPY . .
 
 RUN make
