@@ -1,16 +1,16 @@
-DROP INDEX idx_logins;
-DROP TABLE notifications;
-DROP TABLE post_views;
-DROP TABLE likes;
-DROP TABLE posts;
-DROP TABLE mutes;
-DROP TABLE bans;
-DROP TABLE ratings;
-DROP TABLE logins;
-DROP TABLE gamelog;
-DROP TABLE gameplayers;
-DROP TABLE games;
-DROP TABLE users;
+-- DROP INDEX idx_logins;
+-- DROP TABLE notifications;
+-- DROP TABLE post_views;
+-- DROP TABLE likes;
+-- DROP TABLE posts;
+-- DROP TABLE mutes;
+-- DROP TABLE bans;
+-- DROP TABLE ratings;
+-- DROP TABLE logins;
+-- DROP TABLE gamelog;
+-- DROP TABLE gameplayers;
+-- DROP TABLE games;
+-- DROP TABLE users;
 
 /* Original schema: */
 
