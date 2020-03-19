@@ -12,7 +12,7 @@ jobs:
       
     - uses: cschleiden/replace-tokens@v1
       with:
-        files: '["**/*.json"]'
+        files: '["sample_options.json"]'
       env:
         POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
         POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}  
